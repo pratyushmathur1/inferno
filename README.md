@@ -1,36 +1,79 @@
 # Inferno
 
-A small Llama-style inference engine: paged KV cache, continuous batching, and the kernels underneath. The serving loop is ordinary C++ and is tested without a GPU. CUDA GEMM, RMSNorm, RoPE, softmax, online attention, and CUDA graph capture live in `kernels/cuda_kernels.cu` and compile with `-DINFERNO_CUDA=ON`.
+Inferno is a from-scratch Llama-style inference server. An HTTP request enters a queue, a scheduler builds a continuous batch, and a paged KV cache feeds a small transformer. The serving loop and the CPU kernels are what `make test` checks.
 
 ```
 HTTP  POST /v1/completions
         |
    request queue          Engine::submit
         |
- continuous batching      chunked prefill, FCFS, priority preemption
+ continuous batching      chunked prefill, first-come preemption
         |
    prefill / decode       one packed forward per scheduler step
         |
-     paged KV             block tables, page-sized attention tiles
+     paged KV             block table per sequence
         |
-   CPU reference          GEMM, RMSNorm, RoPE, SwiGLU, online softmax
-   CUDA kernels           same operators + CUDA graph replay
-        |
-       GPU                when this tree is built with INFERNO_CUDA
+   CPU kernels            GEMM, RMSNorm, RoPE, SwiGLU, online softmax
 ```
+
+`kernels/cuda_kernels.cu` contains CUDA GEMM, RMSNorm, RoPE, softmax, an online attention kernel, and a CUDA-graph replay of that chain. Those operators compile with `-DINFERNO_CUDA=ON`. The server and `inferno bench` call the CPU kernels.
+
+The model is a grouped-query Llama block: RMSNorm, rotate-half RoPE, SwiGLU. Weights are float32 in an `INF1` file from `inferno init-model`. Requests use token ids. There is no text tokenizer. Temperature `0` is greedy; otherwise sampling is top-k.
+
+## Correctness
+
+`make test` covers:
+
+| Behavior | Check |
+|---|---|
+| GEMM, RMSNorm, RoPE, softmax | closed-form values |
+| Online attention | max abs error under `1e-4` versus a full score matrix |
+| Paged attention | bitwise match with the dense online walk, including a non-contiguous block table |
+| Chunked prefill and mixed batches | same greedy tokens as one sequence at a time |
+| Preemption | a tight page pool still matches serial greedy output |
+| Speculative decoding | draft proposals, greedy output matches the target model alone |
+| INT8 and FP8 E4M3 GEMM | a hand-computed dot product, and exact round-trip of 1, 0.5, and 2 |
+| Tensor-parallel linear | column split and row split plus an allreduce match the unsplit GEMM |
+| HTTP | `GET /health` and `POST /v1/completions` |
+
+The online attention kernel is the FlashAttention recurrence (running max and sum) over one key at a time. A page is the allocation unit of the cache. Column- and row-parallel GEMM are single-layer checks, not a multi-GPU server.
+
+## Results
+
+Measured on 1 October 2026 with the Release build on one AMD EPYC 7543 (32 cores). CUDA was not linked. The bench model is 2 layers, hidden size 64, 4 query heads, 2 KV heads, head size 16, vocab 128.
+
+Eight sequences, 12 prompt tokens and 12 new tokens each, greedy:
+
+| Run | Time | Output |
+|---|---|---|
+| One engine, all eight sequences | 1.80 s | 96 tokens, 53 tokens/s |
+| Eight separate engines, summed | 6.50 s | same workload |
+| One sequence, full prefix recomputed for every new token | 0.203 s | 12 new tokens |
+
+Sharing one engine across the eight sequences took 3.6× less wall time than eight separate engines. At this model size, recomputing a single short sequence from scratch was faster than serving that sequence through the scheduler, so this run is a batching measurement, not a claim that the KV cache beats prefill here.
+
+Kernel microbenchmarks, same machine:
+
+| Kernel | Result |
+|---|---|
+| GEMM 256×256×256, plain | 79.0 ms, 0.42 GFLOP/s |
+| GEMM 256×256×256, tiled 32 | 99.5 ms, 0.34 GFLOP/s, max abs diff 0 |
+| Attention T=128, 8 heads, dim 32, full softmax | 1.49 ms |
+| Same attention, online softmax | 97.2 ms, max abs diff 1.6e-7 |
+
+The tiled GEMM matches the plain GEMM and is slower at this size. The online attention matches the full softmax numerically and is slower in this scalar CPU implementation.
+
+PyTorch and vLLM have not been timed. `scripts/compare_pytorch.py` loads an `INF1` file and prints one greedy next-token id when PyTorch is installed. vLLM does not read this checkpoint format.
 
 ## Build
 
-This login node has GCC and CMake and does not have `nvcc`. `make` forces `g++` so an MPI compiler wrapper earlier on `PATH` is not picked up.
-
 ```bash
-cd inferno
 make test
 ./build/inferno demo
 ./build/inferno bench
 ```
 
-GPU node:
+`make` calls CMake in Release and uses `g++` (`COMPILER=g++` overrides that). A CUDA build:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -51,51 +94,14 @@ curl -s http://127.0.0.1:8000/v1/completions \
   -d '{"token_ids":[1,5,9,12],"max_tokens":16,"temperature":0}'
 ```
 
-`GET /health` and `GET /metrics` are also there. Token ids are the vocabulary; there is no text tokenizer. Sampling is greedy when `temperature` is 0, otherwise top-k.
-
-Concurrent clients are accepted on their own connections and pulled into the running batch between steps. A sequence that cannot get another KV page is preempted if a newer sequence is holding pages; its tokens stay, and its cache is rebuilt. Greedy output matches running that request alone.
-
-## What is implemented
-
-| Piece | Where | Checked by |
-|---|---|---|
-| GEMM, tiled GEMM, RMSNorm, RoPE, softmax, SiLU | `src/cpu_kernels.cpp` | unit tests |
-| Online-softmax attention (FlashAttention-style) | same, and paged walk in `src/paged_cache.cpp` | matches a full score matrix; paged path matches the dense walk bit for bit |
-| Paged KV cache | `PagedCache` | block table can be non-contiguous |
-| Continuous batching + chunked prefill | `Scheduler` | mixed-length batch matches serial greedy; chunk size 3 matches a big batch |
-| Preemption | oldest request wins | tight page pool, outputs still match serial |
-| Speculative decoding | `speculative_generate` | greedy tokens match the target model with no draft |
-| INT8 W8A8 GEMM and E4M3 FP8 GEMM | `kernels` | hand values and round-trip of 1, 0.5, 2 |
-| Tensor parallel GEMM | column split and row split + sum | exact vs the unsplit GEMM |
-| HTTP | `HttpServer` | `/health` and `/v1/completions` |
-| CUDA kernels + CUDA graph | `kernels/cuda_kernels.cu` | built only with `INFERNO_CUDA`; `inferno bench` reports graph replay when a device is present |
-
-The model is a GQA Llama block: RMSNorm, rotate-half RoPE, SwiGLU. Weights are float32 in an `INF1` file (`inferno init-model`).
-
-## Bench against PyTorch and vLLM
-
-`inferno bench` reports three numbers on one machine:
-
-- naive GEMM vs a tiled GEMM
-- full-softmax attention vs the online algorithm
-- continuous batching vs one engine per request, and vs a baseline that replays the whole prefix for every new token
-
-That last gap is the KV cache. On a GPU node, put PyTorch next to it with the same checkpoint:
-
-```bash
-python3 scripts/compare_pytorch.py model.bin --tokens 1,2,3,4
-```
-
-The script needs PyTorch. It prints the greedy next-token id for one prefill using the same weight order and the same rotate-half RoPE. vLLM will not load `INF1`; the comparison that matches how vLLM is measured is throughput at a fixed concurrency (`vllm bench serve` against `inferno bench`) once a real weight loader is in front of this scheduler.
+`GET /health` and `GET /metrics` are served too. Each connection is its own thread. Between scheduler steps the worker pulls every request that has arrived. If a running sequence needs a KV page and a newer sequence holds one, the newer sequence is preempted, its pages are freed, and its prompt plus already sampled tokens are recomputed.
 
 ## Layout
 
 ```
-include/inferno/     public headers
-src/                 scheduler, model, HTTP, CPU kernels
-kernels/cuda_kernels.cu
-tests/test_inferno.cpp
+include/inferno/          public headers
+src/                      scheduler, model, HTTP, CPU kernels
+kernels/cuda_kernels.cu   CUDA operators and graph replay
+tests/test_inferno.cpp    correctness tests
 scripts/compare_pytorch.py
 ```
-
-`make test` is the check that should pass before changing the scheduler or the cache.
