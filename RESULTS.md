@@ -1,8 +1,16 @@
 # Inferno GPU experiments
 
-## Thesis
+## Goal
 
-**Correctness-preserving continuous batching + public ablations.** Every serving optimization (graphs, GEMM backend, batch size) keeps greedy token identity with the serial path, and every switch ships with a measured table. Kernel work (cuBLAS now; FlashDecoding / INT8 next) lands behind the same flags.
+Build a small, from-scratch LLM **serving** stack and prove continuous batching + paged KV + GPU kernels can get faster **without changing greedy answers**. Every optimization sits behind a flag, keeps token identity with the serial path, and ships with a measured table.
+
+## What these numbers show
+
+- **cuBLAS** is the production GEMM; tiled stays as `--naive-gemm`. Same greedy tokens; **6.7× / 8.9×** tok/s on mid / large.
+- On mid, GEMM drops from ~78% → ~29% of profiled decode time after cuBLAS.
+- Continuous batching scales nearly linearly in batch size; graphs add ~15% on mid with cuBLAS (34796 vs 30195).
+- Earlier tiled Inferno trailed vLLM on large_h64; cuBLAS Inferno is ahead of that prior baseline on the same toy weights.
+
 
 ---
 
@@ -85,7 +93,7 @@ Raw JSON: `results/gpu_sweep_latest.json`.
 
 ## Takeaways
 
-- **cuBLAS is the production GEMM**; tiled stays as `--naive-gemm` for teaching and ablations. Same greedy tokens.
-- On mid, GEMM drops from ~78% → ~29% of profiled decode time; end-to-end tok/s jumps ~6.7×.
-- Continuous batching still scales nearly linearly in batch size; graphs add ~15% on mid after cuBLAS (34796 vs 30195).
-- Next kernel destination: FlashDecoding-style paged attention + weight-only INT8, still behind flags with correctness checks.
+- The project goal is serving correctness first: batching and preemption must not change greedy output; speedups are ablated in public tables.
+- **cuBLAS is the production GEMM**; tiled stays as `--naive-gemm` for teaching and ablations.
+- Continuous batching still scales nearly linearly in batch size; graphs remain a measurable but secondary win after the GEMM swap.
+
