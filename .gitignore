@@ -1,10 +1,15 @@
 build/
 build-gpu/
 gpu-job.out
+inferno-dev.out
+hf-download.log
 compare-*.out
 *.bin
+*.inf1
 *.o
 .cache/
 scripts/__pycache__/
 __pycache__/
+models/real
+models/smollm2-*
 

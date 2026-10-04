@@ -264,7 +264,7 @@ void test_speculative() {
     inferno::Model draft = inferno::Model::init_random(small_cfg(), 9);
     std::vector<int> prompt = prompt_of(6, target.vocab(), 4);
     auto greedy = gen(target, roomy(), {{1, prompt, 10, 0.f, 1, 1}});
-    auto spec = inferno::speculative_generate(target, draft, prompt, 10, 4, 64, 8);
+    auto spec = inferno::speculative_generate(target, draft, prompt, 10, 4, {64, 8});
     check(spec.tokens == greedy[0].tokens, "speculative greedy matches target-only greedy");
     check(spec.drafted > 0, "draft model proposed tokens");
 }

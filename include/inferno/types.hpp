@@ -32,6 +32,7 @@ struct EngineConfig {
     bool cuda_graphs = false;
     bool use_cublas = true;   // GPU only; false keeps the tiled teaching GEMM
     bool profile_cuda = false;
+    bool fuse_kernels = true; // GPU fused add+rmsnorm
 };
 
 struct Request {

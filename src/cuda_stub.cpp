@@ -22,5 +22,7 @@ int graph_replays(void*) { return 0; }
 
 Profile last_profile(void*) { return {}; }
 
+bool device_mem(size_t&, size_t&) { return false; }
+
 }  // namespace cuda
 }  // namespace inferno

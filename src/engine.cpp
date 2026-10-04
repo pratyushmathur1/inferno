@@ -32,7 +32,7 @@ std::vector<GenerationResult> Engine::generate(const std::vector<Request>& reque
         Step step = sched.prepare();
         std::vector<float> logits;
         model_.forward(step.tokens, cache_, logits, cfg_.use_cuda, cfg_.cuda_graphs, &device_,
-                       cfg_.use_cublas, cfg_.profile_cuda);
+                       cfg_.use_cublas, cfg_.profile_cuda, cfg_.fuse_kernels);
         sched.commit(step, logits.empty() ? nullptr : logits.data(), model_.vocab());
         auto done = sched.pop_finished();
         out.insert(out.end(), done.begin(), done.end());
@@ -47,7 +47,7 @@ void Engine::step(Scheduler& sched) {
     Step step = sched.prepare();
     std::vector<float> logits;
     model_.forward(step.tokens, cache_, logits, cfg_.use_cuda, cfg_.cuda_graphs, &device_,
-                   cfg_.use_cublas, cfg_.profile_cuda);
+                   cfg_.use_cublas, cfg_.profile_cuda, cfg_.fuse_kernels);
     sched.commit(step, logits.empty() ? nullptr : logits.data(), model_.vocab());
     store_metrics(sched.metrics());
 }

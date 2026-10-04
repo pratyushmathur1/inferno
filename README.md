@@ -2,7 +2,7 @@
 
 **Goal:** build a small, from-scratch LLM *serving* stack — not just a transformer forward — and prove that continuous batching, paged KV, and GPU kernels can get faster without changing greedy answers.
 
-Inferno is that stack: an HTTP queue, a continuous-batching scheduler with preemption, a paged KV cache, and matching CPU/GPU Llama (GQA) forwards. Every serving optimization is behind a flag, checked for token identity, and measured on Anvil A100s. The claim is **correctness-preserving continuous batching with public ablations**, not “another mini-vLLM.”
+Inferno is that stack: an HTTP queue, a continuous-batching scheduler with preemption, a paged KV cache, and matching CPU/GPU Llama (GQA) forwards. It runs **real HuggingFace Llama-arch weights** (SmolLM2-135M) with a tokenizer-backed text demo, plus speculative decoding and public ablations. The claim is **correctness-preserving continuous batching with measured optimizations**, not “another mini-vLLM.”
 
 ```
 HTTP  POST /v1/completions
@@ -15,7 +15,7 @@ HTTP  POST /v1/completions
         |
      paged KV             block table per sequence
         |
-   CPU / GPU kernels      GEMM, RMSNorm, RoPE, SwiGLU, paged attn
+   CPU / GPU kernels      cuBLAS GEMM, fused add+RMSNorm, paged attn
 ```
 
 ## What it achieved
@@ -23,14 +23,25 @@ HTTP  POST /v1/completions
 | Goal | Result |
 |---|---|
 | End-to-end serving loop | Queue → continuous batch → paged KV → generate; `POST /v1/completions` |
-| Correctness under batching | Chunked prefill, mixed batches, and preemption match serial greedy (`make test`) |
-| CPU continuous batching | **3.6×** lower wall time than eight separate engines (8×12+12) |
-| GPU path that matches CPU | Same greedy tokens; CUDA graphs on repeated token counts |
+| Real model + tokenizer | SmolLM2-135M Instruct → INF1; greedy tokens match HuggingFace FP32 |
+| Text demo | `python3 scripts/generate_text.py … --prompt "…"` |
+| Correctness under batching | Chunked prefill, mixed batches, preemption match serial greedy |
+| Speculative decoding | Leviathan greedy verify; acceptance % + speedup vs target-only; output matches |
 | Close the naive-GEMM gap | **cuBLAS** default; tiled teaching GEMM via `--naive-gemm` |
-| Measure where time goes | `profile-forward` CUDA-event breakdown (GEMM / attn / norm / …) |
-| Fair external baselines | Same INF1 weights vs PyTorch and vLLM (`scripts/compare_bench.py`) |
+| Fused CUDA kernels | `rmsnorm_save_residual` + `add_rmsnorm`; `--no-fuse` ablation |
+| Serious latency metrics | `bench-latency`: TTFT, ITL, tok/s, GPU memory vs PyTorch |
+| Fair external baselines | Same weights vs PyTorch / vLLM |
 
-**Headline GPU numbers** (A100-SXM4-40GB, 8 sequences × 12 prompt + 12 new, greedy; full tables in [`RESULTS.md`](RESULTS.md)):
+### Real model (SmolLM2-135M, A100)
+
+| Engine | tok/s | TTFT ms | ITL ms | GPU mem MB |
+|---|---:|---:|---:|---:|
+| Inferno FP32 + cuBLAS | **278** | **7.9** | **3.4** | 1744 |
+| PyTorch FP16 generate | 36 | 30.5 | 27.9 | 336 |
+
+Prompt: chat-templated “Explain continuous batching in two sentences.”, 32 new tokens max (27 emitted). Inferno is FP32; PyTorch baseline is FP16 — memory is not apples-to-apples, latency is.
+
+### Toy-model throughput (8×12+12 greedy)
 
 | Engine | mid (2×256) tok/s | large (4×512) tok/s |
 |---|---:|---:|
@@ -39,13 +50,60 @@ HTTP  POST /v1/completions
 | vLLM 0.4.2 (prior sweep) | 2146 | 1709 |
 | PyTorch serial KV (prior sweep) | 574 | 308 |
 
-cuBLAS vs tiled is **6.7× / 8.9×** on mid / large with **identical greedy tokens**. That is the measured payoff of swapping the teaching GEMM for a production library while keeping the serving story intact.
+Full tables: [`RESULTS.md`](RESULTS.md).
+
+## Real Llama weights + text demo
+
+```bash
+# convert a HF Llama/SmolLM checkpoint to INF1 (float32)
+python3 scripts/hf_to_inf1.py HuggingFaceTB/SmolLM2-135M-Instruct -o models/smollm2-135m.inf1
+
+# optional shallow draft for speculative decoding
+python3 scripts/make_draft.py models/smollm2-135m.inf1 -o models/draft.inf1 --layers 15
+
+# text generate (HF tokenizer → Inferno → detokenize)
+python3 scripts/generate_text.py \
+  -m models/smollm2-135m.inf1 \
+  --hf HuggingFaceTB/SmolLM2-135M-Instruct \
+  --prompt "Say hello in one short sentence." --chat --max-new 64 \
+  --inferno ./build-gpu/inferno
+```
+
+## Speculative decoding
+
+```bash
+./build-gpu/inferno speculate -m target.inf1 --draft draft.inf1 \
+  --tokens 1,2,3 --max-new 32 --gamma 4 --cuda
+```
+
+Prints `accept_pct`, `spec_ms`, `target_only_ms`, `speedup`. Self-draft (`--draft` = target) reaches ~100% accept and must match target-only greedy tokens. A truncated-layer draft is a cheap baseline (low accept until you train a real drafter).
+
+## Fused kernels
+
+Profile showed copy/add launch overhead next to RMSNorm. Inferno fuses:
+
+1. **`rmsnorm_save_residual`** — residual copy + RMSNorm  
+2. **`add_rmsnorm`** — residual add + RMSNorm (and refresh residual for the FFN)
+
+Default on; disable with `--no-fuse`. CUDA-event tables: `results/profile_mid_fused.txt` vs `profile_mid_unfused.txt` (misc ~10% → ~5% on mid).
+
+## Serious benchmarking
+
+```bash
+python3 scripts/serious_bench.py models/smollm2-135m.inf1 \
+  --hf HuggingFaceTB/SmolLM2-135M-Instruct \
+  --inferno ./build-gpu/inferno \
+  --prompt "Explain continuous batching in two sentences." --chat \
+  --max-new 32 --out results/serious_bench.json
+```
+
+Uses in-process `inferno bench-latency` (TTFT / ITL / tok/s / GPU mem) so weight load is not counted in the timed window.
 
 ## How it works
 
-The model is a grouped-query Llama block: RMSNorm, rotate-half RoPE, SwiGLU. Weights are float32 in an `INF1` file from `inferno init-model`. Requests use token ids (no text tokenizer). Temperature `0` is greedy; otherwise sampling is top-k.
+The model is a grouped-query Llama block: RMSNorm, rotate-half RoPE, SwiGLU. Weights are float32 in an `INF1` file (`init-model` or `hf_to_inf1.py`). Temperature `0` is greedy; otherwise sampling is top-k.
 
-`kernels/cuda_kernels.cu` is the GPU forward: **cuBLAS GEMM by default**, tiled GEMM via `--naive-gemm`, RMSNorm, RoPE, SwiGLU, and page-at-a-time attention. Matching token counts capture into a CUDA graph. `inferno profile-forward` prints the event breakdown. `make test` exercises the CPU kernels and the scheduler/cache properties above.
+`kernels/cuda_kernels.cu`: **cuBLAS GEMM**, optional tiled GEMM, fused add/RMSNorm, RoPE, SwiGLU, page-at-a-time attention, CUDA graphs. `profile-forward` prints the event breakdown.
 
 ## Correctness
 
@@ -63,88 +121,39 @@ The model is a grouped-query Llama block: RMSNorm, rotate-half RoPE, SwiGLU. Wei
 | Tensor-parallel linear | column split and row split plus an allreduce match the unsplit GEMM |
 | HTTP | `GET /health` and `POST /v1/completions` |
 
-The online attention kernel is the FlashAttention recurrence (running max and sum) over one key at a time. A page is the allocation unit of the cache. Column- and row-parallel GEMM are single-layer checks, not a multi-GPU server.
-
-## Results (detail)
-
-**CPU (1 Oct 2026, AMD EPYC 7543):** continuous batching of 8 short sequences was 3.6× lower wall time than eight separate engines (1.80 s vs 6.50 s).
-
-Eight sequences, 12 prompt + 12 new, greedy:
-
-| Run | Time | Output |
-|---|---|---|
-| One engine, all eight sequences | 1.80 s | 96 tokens, 53 tokens/s |
-| Eight separate engines, summed | 6.50 s | same workload |
-| One sequence, full prefix recomputed each step | 0.203 s | 12 new tokens |
-
-Kernel microbenchmarks on that CPU:
-
-| Kernel | Result |
-|---|---|
-| GEMM 256×256×256, plain | 79.0 ms, 0.42 GFLOP/s |
-| GEMM 256×256×256, tiled 32 | 99.5 ms, 0.34 GFLOP/s, max abs diff 0 |
-| Attention T=128, 8 heads, dim 32, full softmax | 1.49 ms |
-| Same attention, online softmax | 97.2 ms, max abs diff 1.6e-7 |
-
-**GPU ablations** (graphs on/off, batch size, sequence length, cuBLAS vs tiled, PyTorch/vLLM): [`RESULTS.md`](RESULTS.md) and `results/*.json`.
-
 ## Build
 
 ```bash
 make test
 ./build/inferno demo
-./build/inferno bench
+
+cmake -S . -B build-gpu -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_COMPILER=g++ -DINFERNO_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=80
+cmake --build build-gpu -j
 ```
 
-`make` calls CMake in Release and uses `g++` (`COMPILER=g++` overrides that). A CUDA build:
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CXX_COMPILER=g++ -DINFERNO_CUDA=ON
-cmake --build build -j
-```
+GPU flags: `--cuda` / `--cpu` / `--no-graphs` / `--naive-gemm` / `--no-fuse` / `--profile-forward`.
 
 ## Serve
 
 ```bash
-./build/inferno init-model -o model.bin --seed 1
-./build/inferno serve -m model.bin --port 8000
-```
-
-```bash
+./build-gpu/inferno serve -m models/smollm2-135m.inf1 --port 8000
 curl -s http://127.0.0.1:8000/v1/completions \
   -H 'content-type: application/json' \
   -d '{"token_ids":[1,5,9,12],"max_tokens":16,"temperature":0}'
 ```
 
-`GET /health` and `GET /metrics` are served too. Each connection is its own thread. Between scheduler steps the worker pulls every request that has arrived. If a running sequence needs a KV page and a newer sequence holds one, the newer sequence is preempted, its pages are freed, and its prompt plus already sampled tokens are recomputed.
-
 ## Layout
 
 ```
 include/inferno/             public headers
-src/                         scheduler, model, HTTP, CPU kernels
-kernels/cuda_kernels.cu      CUDA operators and graph replay
-tests/test_inferno.cpp       correctness tests
-results/                     GPU sweep JSON
-RESULTS.md                   GPU experiment tables
-scripts/compare_bench.py     Inferno vs PyTorch / vLLM
-scripts/run_experiments.py   batch / length / model / cross-engine sweep
-scripts/compare_job.sh       GPU job that builds, installs torch, runs comparison
+src/                         scheduler, model, HTTP, CPU kernels, speculative
+kernels/cuda_kernels.cu      CUDA operators, fusion, graphs, cuBLAS
+scripts/hf_to_inf1.py        HF Llama → INF1
+scripts/generate_text.py     tokenizer-backed text demo
+scripts/make_draft.py        shallow draft for speculative decoding
+scripts/serious_bench.py     TTFT / ITL / throughput / memory
+scripts/compare_bench.py     Inferno vs PyTorch / vLLM (toy INF1)
+RESULTS.md                   experiment tables
+results/                     JSON + profile dumps
 ```
-
-## Compare and ablate
-
-Same workload: 8 sequences × (12 prompt + 12 new), greedy. Use `head_dim=64` (or another vLLM-supported size) when including vLLM.
-
-```bash
-bash scripts/compare_job.sh
-python3 scripts/compare_bench.py model.bin --inferno ./build-gpu/inferno
-python3 scripts/run_experiments.py
-
-./build-gpu/inferno compare-workload -m model.bin --seqs 8 --prompt 12 --max-new 12
-./build-gpu/inferno compare-workload -m model.bin --naive-gemm   # teaching tiled GEMM
-./build-gpu/inferno profile-forward -m model.bin --seqs 8 --prompt 12 --max-new 4
-```
-
-GPU flags: `--cuda` / `--cpu` / `--no-graphs` / `--naive-gemm` / `--profile-forward`.

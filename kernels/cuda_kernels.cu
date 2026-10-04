@@ -91,6 +91,63 @@ __global__ void rmsnorm_kernel(const float* x, const float* weight, float* y, in
     for (int i = threadIdx.x; i < dim; i += blockDim.x) out[i] = row[i] * red * weight[i];
 }
 
+// One launch: residual = x, y = rmsnorm(x). Removes a separate copy before attn/FFN norms.
+__global__ void rmsnorm_save_residual_kernel(const float* x, float* residual, const float* weight, float* y,
+                                             int rows, int dim, float eps) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const float* row = x + static_cast<long long>(r) * dim;
+    float* res = residual + static_cast<long long>(r) * dim;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float v = row[i];
+        res[i] = v;
+        ss += v * v;
+    }
+    __shared__ float red;
+    __shared__ float buf[128];
+    buf[threadIdx.x] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float tot = 0.f;
+        for (int i = 0; i < blockDim.x; ++i) tot += buf[i];
+        red = rsqrtf(tot / static_cast<float>(dim) + eps);
+    }
+    __syncthreads();
+    float* out = y + static_cast<long long>(r) * dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) out[i] = row[i] * red * weight[i];
+}
+
+// One launch: x = a + b, residual = x, y = rmsnorm(x).
+__global__ void add_rmsnorm_kernel(const float* a, const float* b, const float* weight, float* x, float* residual,
+                                   float* y, int rows, int dim, float eps) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    float* xrow = x + static_cast<long long>(r) * dim;
+    float* res = residual + static_cast<long long>(r) * dim;
+    const float* arow = a + static_cast<long long>(r) * dim;
+    const float* brow = b + static_cast<long long>(r) * dim;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float v = arow[i] + brow[i];
+        xrow[i] = v;
+        res[i] = v;
+        ss += v * v;
+    }
+    __shared__ float red;
+    __shared__ float buf[128];
+    buf[threadIdx.x] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float tot = 0.f;
+        for (int i = 0; i < blockDim.x; ++i) tot += buf[i];
+        red = rsqrtf(tot / static_cast<float>(dim) + eps);
+    }
+    __syncthreads();
+    float* out = y + static_cast<long long>(r) * dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) out[i] = xrow[i] * red * weight[i];
+}
+
 __global__ void rope_kernel(float* q, const int* positions, int tokens, int heads, int dim, float theta) {
     const int t = blockIdx.x;
     const int h = blockIdx.y;
@@ -242,6 +299,16 @@ void launch_rmsnorm(const float* x, const float* w, float* y, int rows, int dim,
     rmsnorm_kernel<<<rows, 128, 0, stream>>>(x, w, y, rows, dim, eps);
 }
 
+void launch_rmsnorm_save(const float* x, float* residual, const float* w, float* y, int rows, int dim, float eps,
+                         cudaStream_t stream) {
+    rmsnorm_save_residual_kernel<<<rows, 128, 0, stream>>>(x, residual, w, y, rows, dim, eps);
+}
+
+void launch_add_rmsnorm(const float* a, const float* b, const float* w, float* x, float* residual, float* y,
+                        int rows, int dim, float eps, cudaStream_t stream) {
+    add_rmsnorm_kernel<<<rows, 128, 0, stream>>>(a, b, w, x, residual, y, rows, dim, eps);
+}
+
 struct EventPair {
     cudaEvent_t a = nullptr;
     cudaEvent_t b = nullptr;
@@ -271,6 +338,7 @@ struct Runner {
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
     bool use_cublas = true;
+    bool fuse_kernels = true;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
     int exec_t = -1;
@@ -356,8 +424,12 @@ struct Live : Runner {
         embed_kernel<<<T, 128, 0, s>>>(token_ids, weights + tok_emb.off, x, H);
         for (int layer = 0; layer < cfg.n_layers; ++layer) {
             const LayerOff& off = layers[layer];
-            copy_kernel<<<blocks(T * H), 256, 0, s>>>(x, residual, T * H);
-            launch_rmsnorm(x, weights + off.rms1.off, xn, T, H, cfg.rms_eps, s);
+            if (fuse_kernels) {
+                launch_rmsnorm_save(x, residual, weights + off.rms1.off, xn, T, H, cfg.rms_eps, s);
+            } else {
+                copy_kernel<<<blocks(T * H), 256, 0, s>>>(x, residual, T * H);
+                launch_rmsnorm(x, weights + off.rms1.off, xn, T, H, cfg.rms_eps, s);
+            }
             gemm(xn, weights + off.wq.off, q, T, Qdim, H, s);
             gemm(xn, weights + off.wk.off, k, T, Kdim, H, s);
             gemm(xn, weights + off.wv.off, v, T, Kdim, H, s);
@@ -371,10 +443,14 @@ struct Live : Runner {
                 q, kcache, vcache, tables, seq_compact, positions, attn, table_stride, cfg.n_heads, cfg.n_kv_heads,
                 block_size, dim, layer_stride * layer);
             gemm(attn, weights + off.wo.off, proj, T, H, Qdim, s);
-            add_kernel<<<blocks(T * H), 256, 0, s>>>(residual, proj, x, T * H);
-
-            copy_kernel<<<blocks(T * H), 256, 0, s>>>(x, residual, T * H);
-            launch_rmsnorm(x, weights + off.rms2.off, xn, T, H, cfg.rms_eps, s);
+            if (fuse_kernels) {
+                // x = residual+attn, residual = x (pre-FFN), xn = rmsnorm(x)
+                launch_add_rmsnorm(residual, proj, weights + off.rms2.off, x, residual, xn, T, H, cfg.rms_eps, s);
+            } else {
+                add_kernel<<<blocks(T * H), 256, 0, s>>>(residual, proj, x, T * H);
+                copy_kernel<<<blocks(T * H), 256, 0, s>>>(x, residual, T * H);
+                launch_rmsnorm(x, weights + off.rms2.off, xn, T, H, cfg.rms_eps, s);
+            }
             gemm(xn, weights + off.wgate.off, gate, T, I, H, s);
             gemm(xn, weights + off.wup.off, up, T, I, H, s);
             silu_mul_kernel<<<blocks(T * I), 256, 0, s>>>(gate, up, mid, T * I);
@@ -391,6 +467,7 @@ struct Live : Runner {
         p.tokens = T;
         p.layers = cfg.n_layers;
         p.gemm_backend = use_cublas ? "cublas" : "tiled";
+        p.fused = fuse_kernels;
         const int H = cfg.hidden;
         const int Qdim = cfg.n_heads * cfg.head_dim;
         const int Kdim = cfg.n_kv_heads * cfg.head_dim;
@@ -421,13 +498,18 @@ struct Live : Runner {
 
         for (int layer = 0; layer < cfg.n_layers; ++layer) {
             const LayerOff& off = layers[layer];
-            check(cudaEventRecord(misc_e.a, s), "rec");
-            copy_kernel<<<blocks(T * H), 256, 0, s>>>(x, residual, T * H);
-            finish(misc_e, p.misc_ms);
-
-            check(cudaEventRecord(norm_e.a, s), "rec");
-            launch_rmsnorm(x, weights + off.rms1.off, xn, T, H, cfg.rms_eps, s);
-            finish(norm_e, p.norm_ms);
+            if (fuse_kernels) {
+                check(cudaEventRecord(norm_e.a, s), "rec");
+                launch_rmsnorm_save(x, residual, weights + off.rms1.off, xn, T, H, cfg.rms_eps, s);
+                finish(norm_e, p.norm_ms);
+            } else {
+                check(cudaEventRecord(misc_e.a, s), "rec");
+                copy_kernel<<<blocks(T * H), 256, 0, s>>>(x, residual, T * H);
+                finish(misc_e, p.misc_ms);
+                check(cudaEventRecord(norm_e.a, s), "rec");
+                launch_rmsnorm(x, weights + off.rms1.off, xn, T, H, cfg.rms_eps, s);
+                finish(norm_e, p.norm_ms);
+            }
 
             check(cudaEventRecord(gemm_e.a, s), "rec");
             gemm(xn, weights + off.wq.off, q, T, Qdim, H, s);
@@ -457,14 +539,19 @@ struct Live : Runner {
             gemm(attn, weights + off.wo.off, proj, T, H, Qdim, s);
             finish(gemm_e, p.gemm_ms);
 
-            check(cudaEventRecord(misc_e.a, s), "rec");
-            add_kernel<<<blocks(T * H), 256, 0, s>>>(residual, proj, x, T * H);
-            copy_kernel<<<blocks(T * H), 256, 0, s>>>(x, residual, T * H);
-            finish(misc_e, p.misc_ms);
-
-            check(cudaEventRecord(norm_e.a, s), "rec");
-            launch_rmsnorm(x, weights + off.rms2.off, xn, T, H, cfg.rms_eps, s);
-            finish(norm_e, p.norm_ms);
+            if (fuse_kernels) {
+                check(cudaEventRecord(norm_e.a, s), "rec");
+                launch_add_rmsnorm(residual, proj, weights + off.rms2.off, x, residual, xn, T, H, cfg.rms_eps, s);
+                finish(norm_e, p.norm_ms);
+            } else {
+                check(cudaEventRecord(misc_e.a, s), "rec");
+                add_kernel<<<blocks(T * H), 256, 0, s>>>(residual, proj, x, T * H);
+                copy_kernel<<<blocks(T * H), 256, 0, s>>>(x, residual, T * H);
+                finish(misc_e, p.misc_ms);
+                check(cudaEventRecord(norm_e.a, s), "rec");
+                launch_rmsnorm(x, weights + off.rms2.off, xn, T, H, cfg.rms_eps, s);
+                finish(norm_e, p.norm_ms);
+            }
 
             check(cudaEventRecord(gemm_e.a, s), "rec");
             gemm(xn, weights + off.wgate.off, gate, T, I, H, s);
@@ -579,6 +666,14 @@ Profile last_profile(void* slot) {
     return static_cast<Live*>(slot)->last;
 }
 
+bool device_mem(size_t& used_bytes, size_t& total_bytes) {
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return false;
+    total_bytes = total_b;
+    used_bytes = total_b - free_b;
+    return true;
+}
+
 void llama_forward(const ModelConfig& cfg, const float* weights, std::int64_t nweights, const LayerOff* layers,
                    const std::vector<TokenIn>& tokens, PagedCache& cache, std::vector<float>& logits,
                    ForwardOptions opts, void*& slot) {
@@ -598,8 +693,9 @@ void llama_forward(const ModelConfig& cfg, const float* weights, std::int64_t nw
     Live& dev = *static_cast<Live*>(slot);
     if (!dev.stream) check(cudaStreamCreate(&dev.stream), "stream");
     if (!dev.blas) check_cublas(cublasCreate(&dev.blas), "cublasCreate");
-    if (dev.use_cublas != opts.use_cublas) {
+    if (dev.use_cublas != opts.use_cublas || dev.fuse_kernels != opts.fuse_kernels) {
         dev.use_cublas = opts.use_cublas;
+        dev.fuse_kernels = opts.fuse_kernels;
         dev.drop_graph();
     }
 

@@ -159,7 +159,8 @@ Model Model::load(const std::string& path) {
 }
 
 void Model::forward(const std::vector<TokenIn>& tokens, PagedCache& cache, std::vector<float>& logits,
-                    bool use_gpu, bool cuda_graphs, void** gpu, bool use_cublas, bool profile) {
+                    bool use_gpu, bool cuda_graphs, void** gpu, bool use_cublas, bool profile,
+                    bool fuse_kernels) {
     const int T = static_cast<int>(tokens.size());
     logits.clear();
     if (T == 0) return;
@@ -169,6 +170,7 @@ void Model::forward(const std::vector<TokenIn>& tokens, PagedCache& cache, std::
         opts.graphs = cuda_graphs && !profile;
         opts.use_cublas = use_cublas;
         opts.profile = profile;
+        opts.fuse_kernels = fuse_kernels;
         cuda::llama_forward(cfg_, weights_.data(), static_cast<std::int64_t>(weights_.size()), layers_.data(),
                             tokens, cache, logits, opts, *gpu);
         return;

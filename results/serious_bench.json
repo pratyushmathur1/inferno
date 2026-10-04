@@ -1,0 +1,40 @@
+{
+  "prompt": "Explain continuous batching in two sentences.",
+  "prompt_tokens": 38,
+  "max_new": 32,
+  "hf": "/anvil/scratch/x-pmathur1/hf/SmolLM2-135M-Instruct",
+  "inf1": "/anvil/scratch/x-pmathur1/inferno-models/smollm2-135m.inf1",
+  "results": [
+    {
+      "wall_ms": 97.2212,
+      "ttft_ms": 7.89661,
+      "itl_ms": 3.43556,
+      "new_tokens": 27,
+      "tok_s": 277.717,
+      "gpu_mem_mb": 1744.06,
+      "fuse": true,
+      "device": "gpu",
+      "engine": "inferno"
+    },
+    {
+      "wall_ms": 92.9266,
+      "ttft_ms": 7.59902,
+      "itl_ms": 3.28183,
+      "new_tokens": 27,
+      "tok_s": 290.552,
+      "gpu_mem_mb": 1746.06,
+      "fuse": false,
+      "device": "gpu",
+      "engine": "inferno"
+    },
+    {
+      "engine": "pytorch",
+      "wall_ms": 755.6854779832065,
+      "ttft_ms": 30.53632890805602,
+      "itl_ms": 27.890351887505787,
+      "tok_s": 35.729150270372166,
+      "new_tokens": 27,
+      "gpu_mem_mb": 336.31103515625
+    }
+  ]
+}

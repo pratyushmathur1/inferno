@@ -1,5 +1,9 @@
 #include "inferno/speculative.hpp"
 
+#include "inferno/cuda_api.hpp"
+#include "inferno/engine.hpp"
+
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -23,6 +27,8 @@ int argmax(const float* logits, int n) {
 struct Stream {
     Model* model = nullptr;
     PagedCache* cache = nullptr;
+    void** device = nullptr;
+    SpeculativeConfig cfg{};
     std::vector<int> tokens;
     std::vector<int> blocks;
     std::vector<float> pending;
@@ -54,17 +60,14 @@ struct Stream {
             tok.emit = all_logits || i == n - 1;
             batch.push_back(tok);
         }
-        model->forward(batch, *cache, logits);
+        model->forward(batch, *cache, logits, cfg.use_cuda, cfg.cuda_graphs, device, cfg.use_cublas,
+                       /*profile=*/false, cfg.fuse_kernels);
         computed += n;
     }
 };
 
-}  // namespace
-
-SpeculativeStats speculative_generate(Model& target_model, Model& draft_model,
-                                      const std::vector<int>& prompt,
-                                      int max_new, int gamma,
-                                      int num_blocks, int block_size) {
+SpeculativeStats run_spec(Model& target_model, Model& draft_model, const std::vector<int>& prompt,
+                          int max_new, int gamma, SpeculativeConfig cfg) {
     if (prompt.empty()) throw std::runtime_error("empty prompt");
     if (max_new < 0 || gamma < 1) throw std::runtime_error("bad speculative config");
     if (target_model.vocab() != draft_model.vocab()) {
@@ -73,15 +76,21 @@ SpeculativeStats speculative_generate(Model& target_model, Model& draft_model,
     const int vocab = target_model.vocab();
     const auto tc = target_model.config();
     const auto dc = draft_model.config();
-    PagedCache target_cache(tc.n_layers, tc.n_kv_heads, tc.head_dim, num_blocks, block_size);
-    PagedCache draft_cache(dc.n_layers, dc.n_kv_heads, dc.head_dim, num_blocks, block_size);
+    PagedCache target_cache(tc.n_layers, tc.n_kv_heads, tc.head_dim, cfg.num_blocks, cfg.block_size);
+    PagedCache draft_cache(dc.n_layers, dc.n_kv_heads, dc.head_dim, cfg.num_blocks, cfg.block_size);
 
+    void* target_dev = nullptr;
+    void* draft_dev = nullptr;
     Stream target;
     target.model = &target_model;
     target.cache = &target_cache;
+    target.device = cfg.use_cuda ? &target_dev : nullptr;
+    target.cfg = cfg;
     Stream draft;
     draft.model = &draft_model;
     draft.cache = &draft_cache;
+    draft.device = cfg.use_cuda ? &draft_dev : nullptr;
+    draft.cfg = cfg;
     target.tokens = prompt;
     draft.tokens = prompt;
 
@@ -91,6 +100,8 @@ SpeculativeStats speculative_generate(Model& target_model, Model& draft_model,
         return stats;
     }
 
+    auto t0 = std::chrono::steady_clock::now();
+
     std::vector<float> logits;
     target.forward(static_cast<int>(prompt.size()), false, logits);
     target.pending.swap(logits);
@@ -98,7 +109,12 @@ SpeculativeStats speculative_generate(Model& target_model, Model& draft_model,
     draft.pending.swap(logits);
 
     const int prompt_len = static_cast<int>(prompt.size());
+    const int eos = target_model.config().eos_id;
     while (static_cast<int>(target.tokens.size()) - prompt_len < max_new) {
+        if (eos >= 0 && static_cast<int>(target.tokens.size()) > prompt_len &&
+            target.tokens.back() == eos) {
+            break;
+        }
         const int prefix_len = static_cast<int>(target.tokens.size());
         const int room = max_new - (prefix_len - prompt_len);
         const int g = std::min(gamma, room);
@@ -138,7 +154,17 @@ SpeculativeStats speculative_generate(Model& target_model, Model& draft_model,
         }
 
         int keep = std::min(n_accept, room);
-        const bool take_extra = keep == n_accept && keep < room;
+        if (eos >= 0) {
+            for (int i = 0; i < keep; ++i) {
+                if (target.tokens[static_cast<std::size_t>(prefix_len + i)] == eos) {
+                    keep = i + 1;
+                    break;
+                }
+            }
+        }
+        const bool saw_eos = eos >= 0 && keep > 0 &&
+                             target.tokens[static_cast<std::size_t>(prefix_len + keep - 1)] == eos;
+        const bool take_extra = !saw_eos && keep == n_accept && keep < room;
         target.tokens.resize(static_cast<std::size_t>(prefix_len + keep));
         target.computed = prefix_len + keep;
         stats.accepted_draft += keep;
@@ -147,6 +173,9 @@ SpeculativeStats speculative_generate(Model& target_model, Model& draft_model,
             target.forward(1, false, logits);
             target.pending.swap(logits);
             if (bonus) ++stats.bonus;
+            if (eos >= 0 && extra == eos) {
+                // stop at bonus eos
+            }
         }
 
         draft.tokens = target.tokens;
@@ -156,9 +185,52 @@ SpeculativeStats speculative_generate(Model& target_model, Model& draft_model,
             draft.forward(replay, false, logits);
             draft.pending.swap(logits);
         }
+        if (saw_eos || (eos >= 0 && !target.tokens.empty() && target.tokens.back() == eos)) break;
     }
 
+    stats.wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     stats.tokens = target.tokens;
+    if (target_dev) cuda::release_device(target_dev);
+    if (draft_dev) cuda::release_device(draft_dev);
+    return stats;
+}
+
+}  // namespace
+
+SpeculativeStats speculative_generate(Model& target, Model& draft, const std::vector<int>& prompt,
+                                      int max_new, int gamma, SpeculativeConfig cfg) {
+    return run_spec(target, draft, prompt, max_new, gamma, cfg);
+}
+
+SpeculativeStats speculative_benchmark(Model& target, Model& draft, const std::vector<int>& prompt,
+                                       int max_new, int gamma, SpeculativeConfig cfg) {
+    // Target-only greedy via Engine for a fair wall-clock baseline.
+    EngineConfig ecfg;
+    ecfg.num_blocks = cfg.num_blocks;
+    ecfg.block_size = cfg.block_size;
+    ecfg.use_cuda = cfg.use_cuda;
+    ecfg.cuda_graphs = cfg.cuda_graphs;
+    ecfg.use_cublas = cfg.use_cublas;
+    ecfg.fuse_kernels = cfg.fuse_kernels;
+    Engine engine(target, ecfg);
+    Request req;
+    req.prompt = prompt;
+    req.max_new_tokens = max_new;
+    req.temperature = 0.f;
+    // Warmup uploads weights / graphs so the timed window is decode.
+    engine.generate({req});
+    auto t0 = std::chrono::steady_clock::now();
+    auto greedy = engine.generate({req});
+    double target_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+    // Warmup speculative path too (separate device slots).
+    (void)run_spec(target, draft, prompt, max_new, gamma, cfg);
+    auto stats = run_spec(target, draft, prompt, max_new, gamma, cfg);
+    stats.target_only_ms = target_ms;
+    if (stats.tokens != greedy[0].tokens) {
+        throw std::runtime_error("speculative output diverged from target-only greedy");
+    }
     return stats;
 }
 

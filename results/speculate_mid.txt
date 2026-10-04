@@ -1,0 +1,13 @@
+SPECULATE {
+  "gamma":4,
+  "drafted":122,
+  "accepted_draft":0,
+  "bonus":0,
+  "accept_pct":0,
+  "spec_ms":61.5163,
+  "target_only_ms":937.183,
+  "speedup":15.2347,
+  "new_tokens":32,
+  "device":"gpu"
+}
+1 2 3 4 5 6 7 8 379 109 379 109 379 379 379 379 176 379 304 379 379 379 379 379 379 379 379 375 379 375 379 375 379 375 379 379 375 379 379 375

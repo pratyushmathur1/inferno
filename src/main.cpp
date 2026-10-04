@@ -3,7 +3,9 @@
 #include "inferno/engine.hpp"
 #include "inferno/model.hpp"
 #include "inferno/server.hpp"
+#include "inferno/speculative.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <iostream>
@@ -21,10 +23,13 @@ void usage() {
         << "  inferno bench\n"
         << "  inferno init-model -o model.bin [--seed N] [--layers N] [--hidden N] [--vocab N] [--head-dim N]\n"
         << "  inferno generate -m model.bin --tokens 1,2,3 --max-new 16 [--temp 0] [--cpu]\n"
+        << "  inferno speculate -m target.inf1 --draft draft.inf1 --tokens … --max-new 64 --gamma 4\n"
+        << "  inferno bench-latency -m model.inf1 --tokens … --max-new 32\n"
         << "  inferno compare-workload -m model.bin [--seqs 8] [--prompt 12] [--max-new 12] [--cpu]\n"
-        << "  inferno profile-forward -m model.bin [--seqs 8] [--prompt 12] [--max-new 4] [--naive-gemm]\n"
+        << "  inferno profile-forward -m model.bin [--seqs 8] [--prompt 12] [--max-new 4] [--naive-gemm] [--no-fuse]\n"
         << "  inferno serve -m model.bin [--port 8000] [--cpu]\n"
-        << "\nGPU flags: --cuda | --cpu | --no-graphs | --naive-gemm | --profile-forward\n";
+        << "\nGPU flags: --cuda | --cpu | --no-graphs | --naive-gemm | --no-fuse | --profile-forward\n"
+        << "Text demo: python3 scripts/generate_text.py -m model.inf1 --hf <hub_id> --prompt \"…\"\n";
 }
 
 std::vector<int> parse_tokens(const std::string& s) {
@@ -92,6 +97,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         std::string model_path;
+        std::string draft_path;
         std::string token_str;
         std::string out_path = "model.bin";
         int port = 8000;
@@ -103,14 +109,18 @@ int main(int argc, char** argv) {
         int seqs = 8;
         int prompt_len = 12;
         int head_dim = 16;
+        int gamma = 4;
+        int num_blocks = 0;  // 0 → engine default
         float temp = 0.f;
         bool want_cuda = inferno::cuda::available();
         bool graphs = true;
         bool use_cublas = true;
+        bool fuse_kernels = true;
         bool profile_cuda = false;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             if (a == "-m" || a == "--model") model_path = need(i, argc, argv, a);
+            else if (a == "--draft") draft_path = need(i, argc, argv, a);
             else if (a == "-o" || a == "--out") out_path = need(i, argc, argv, a);
             else if (a == "--tokens") token_str = need(i, argc, argv, a);
             else if (a == "--max-new") max_new = std::stoi(need(i, argc, argv, a));
@@ -123,10 +133,13 @@ int main(int argc, char** argv) {
             else if (a == "--head-dim") head_dim = std::stoi(need(i, argc, argv, a));
             else if (a == "--seqs") seqs = std::stoi(need(i, argc, argv, a));
             else if (a == "--prompt") prompt_len = std::stoi(need(i, argc, argv, a));
+            else if (a == "--gamma") gamma = std::stoi(need(i, argc, argv, a));
+            else if (a == "--num-blocks") num_blocks = std::stoi(need(i, argc, argv, a));
             else if (a == "--cpu") want_cuda = false;
             else if (a == "--cuda") want_cuda = true;
             else if (a == "--no-graphs") graphs = false;
             else if (a == "--naive-gemm") use_cublas = false;
+            else if (a == "--no-fuse") fuse_kernels = false;
             else if (a == "--profile-forward") profile_cuda = true;
             else throw std::runtime_error("unknown flag " + a);
         }
@@ -158,7 +171,13 @@ int main(int argc, char** argv) {
         ecfg.use_cuda = want_cuda;
         ecfg.cuda_graphs = want_cuda && graphs && !profile_cuda && cmd != "profile-forward";
         ecfg.use_cublas = use_cublas;
+        ecfg.fuse_kernels = fuse_kernels;
         ecfg.profile_cuda = profile_cuda || cmd == "profile-forward";
+        if (num_blocks > 0) ecfg.num_blocks = num_blocks;
+        // Real models need room for prompt+new; bump if still at default and model is large.
+        if (num_blocks <= 0 && model.config().n_layers >= 8) {
+            ecfg.num_blocks = std::max(ecfg.num_blocks, 512);
+        }
         inferno::Engine engine(model, ecfg);
         if (cmd == "generate") {
             inferno::Request req;
@@ -207,6 +226,7 @@ int main(int argc, char** argv) {
             std::cout << "\"ms\":" << ms << ",\"gen\":" << gen << ",\"tok_s\":" << tok_s
                       << ",\"device\":\"" << (ecfg.use_cuda ? "gpu" : "cpu") << "\""
                       << ",\"gemm\":\"" << (ecfg.use_cublas ? "cublas" : "tiled") << "\""
+                      << ",\"fuse\":" << (ecfg.fuse_kernels ? "true" : "false")
                       << ",\"graph_replays\":" << engine.device_replays()
                       << ",\"sequences\":[";
             for (std::size_t i = 0; i < out.size(); ++i) {
@@ -250,6 +270,7 @@ int main(int argc, char** argv) {
             };
             std::cout << "PROFILE {\n"
                       << "  \"gemm\":\"" << p.gemm_backend << "\",\n"
+                      << "  \"fused\":" << (p.fused ? "true" : "false") << ",\n"
                       << "  \"tokens\":" << p.tokens << ",\"layers\":" << p.layers << ",\n"
                       << "  \"total_ms\":" << p.total_ms << ",\n"
                       << "  \"embed_ms\":" << p.embed_ms << ",\"embed_pct\":" << pct(p.embed_ms) << ",\n"
@@ -275,6 +296,74 @@ int main(int argc, char** argv) {
             row("attn", p.attn_ms);
             row("misc", p.misc_ms);
             row("TOTAL", p.total_ms);
+            return 0;
+        }
+        if (cmd == "speculate") {
+            if (draft_path.empty()) throw std::runtime_error("speculate needs --draft");
+            if (token_str.empty()) throw std::runtime_error("speculate needs --tokens");
+            inferno::Model draft = inferno::Model::load(draft_path);
+            inferno::SpeculativeConfig scfg;
+            scfg.num_blocks = ecfg.num_blocks;
+            scfg.block_size = ecfg.block_size;
+            scfg.use_cuda = ecfg.use_cuda;
+            scfg.cuda_graphs = false;  // shape changes each verify step
+            scfg.use_cublas = ecfg.use_cublas;
+            scfg.fuse_kernels = ecfg.fuse_kernels;
+            auto prompt = parse_tokens(token_str);
+            auto stats = inferno::speculative_benchmark(model, draft, prompt, max_new, gamma, scfg);
+            const double accept =
+                stats.drafted > 0 ? (100.0 * stats.accepted_draft / stats.drafted) : 0.0;
+            const double speedup =
+                stats.wall_ms > 0.0 ? (stats.target_only_ms / stats.wall_ms) : 0.0;
+            std::cout << "SPECULATE {\n"
+                      << "  \"gamma\":" << gamma << ",\n"
+                      << "  \"drafted\":" << stats.drafted << ",\n"
+                      << "  \"accepted_draft\":" << stats.accepted_draft << ",\n"
+                      << "  \"bonus\":" << stats.bonus << ",\n"
+                      << "  \"accept_pct\":" << accept << ",\n"
+                      << "  \"spec_ms\":" << stats.wall_ms << ",\n"
+                      << "  \"target_only_ms\":" << stats.target_only_ms << ",\n"
+                      << "  \"speedup\":" << speedup << ",\n"
+                      << "  \"new_tokens\":" << (stats.tokens.size() - prompt.size()) << ",\n"
+                      << "  \"device\":\"" << (scfg.use_cuda ? "gpu" : "cpu") << "\"\n"
+                      << "}\n";
+            for (std::size_t i = 0; i < stats.tokens.size(); ++i) {
+                if (i) std::cout << ' ';
+                std::cout << stats.tokens[i];
+            }
+            std::cout << "\n";
+            return 0;
+        }
+        if (cmd == "bench-latency") {
+            if (token_str.empty()) throw std::runtime_error("bench-latency needs --tokens");
+            inferno::Request req;
+            req.prompt = parse_tokens(token_str);
+            req.max_new_tokens = max_new;
+            req.temperature = 0.f;
+            engine.generate({req});  // warmup: upload + graphs
+
+            inferno::Request r1 = req;
+            r1.max_new_tokens = 1;
+            auto t0 = std::chrono::steady_clock::now();
+            engine.generate({r1});
+            double ttft_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+            t0 = std::chrono::steady_clock::now();
+            auto out = engine.generate({req});
+            double wall_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            int gen = out.empty() ? 0 : out[0].generated;
+            double itl = gen > 1 ? (wall_ms - ttft_ms) / (gen - 1) : 0.0;
+            size_t used = 0, total = 0;
+            double mem_mb = 0;
+            if (inferno::cuda::device_mem(used, total)) mem_mb = used / (1024.0 * 1024.0);
+            std::cout << "LATENCY "
+                      << "{\"wall_ms\":" << wall_ms << ",\"ttft_ms\":" << ttft_ms << ",\"itl_ms\":" << itl
+                      << ",\"new_tokens\":" << gen << ",\"tok_s\":"
+                      << (wall_ms > 0 ? 1000.0 * gen / wall_ms : 0.0) << ",\"gpu_mem_mb\":" << mem_mb
+                      << ",\"fuse\":" << (ecfg.fuse_kernels ? "true" : "false") << ",\"device\":\""
+                      << (ecfg.use_cuda ? "gpu" : "cpu") << "\"}\n";
             return 0;
         }
         if (cmd == "serve") {
