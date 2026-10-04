@@ -34,7 +34,8 @@ public:
     // Pack tokens from any number of sequences. Logits are concatenated in
     // emit order, shape [num_emits, vocab].
     void forward(const std::vector<TokenIn>& tokens, PagedCache& cache,
-                 std::vector<float>& logits);
+                 std::vector<float>& logits, bool use_gpu = false, bool cuda_graphs = false,
+                 void** gpu = nullptr);
 
 private:
     const float* ptr(Span s) const;

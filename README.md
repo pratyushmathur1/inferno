@@ -14,9 +14,10 @@ HTTP  POST /v1/completions
      paged KV             block table per sequence
         |
    CPU kernels            GEMM, RMSNorm, RoPE, SwiGLU, online softmax
+   GPU kernels            same math, used when CUDA is linked and a device is present
 ```
 
-`kernels/cuda_kernels.cu` contains CUDA GEMM, RMSNorm, RoPE, softmax, an online attention kernel, and a CUDA-graph replay of that chain. Those operators compile with `-DINFERNO_CUDA=ON`. The server and `inferno bench` call the CPU kernels.
+`kernels/cuda_kernels.cu` is the GPU forward: tiled GEMM, RMSNorm, RoPE, SwiGLU, and attention that loads one KV page at a time. On a CUDA build with a device, `demo`, `generate`, `serve`, and `bench` run that forward. A step whose token count matches the previous step is captured into a CUDA graph and replayed. `make test` still runs the CPU kernels.
 
 The model is a grouped-query Llama block: RMSNorm, rotate-half RoPE, SwiGLU. Weights are float32 in an `INF1` file from `inferno init-model`. Requests use token ids. There is no text tokenizer. Temperature `0` is greedy; otherwise sampling is top-k.
 
@@ -40,7 +41,19 @@ The online attention kernel is the FlashAttention recurrence (running max and su
 
 ## Results
 
-Measured on 1 October 2026 with the Release build on one AMD EPYC 7543 (32 cores). CUDA was not linked. The bench model is 2 layers, hidden size 64, 4 query heads, 2 KV heads, head size 16, vocab 128.
+**CPU (1 Oct 2026, AMD EPYC 7543, no CUDA):** continuous batching of 8 short sequences was 3.6× lower wall time than eight separate engines (1.80 s vs 6.50 s). Details of that login-node run are kept below for history.
+
+**GPU (4 Oct 2026, NVIDIA A100-SXM4-40GB):** full sweep in [`RESULTS.md`](RESULTS.md) and `results/gpu_sweep_latest.json`. Headline numbers on the mid model (2×256, head_dim 64), 8 sequences × 12+12 greedy:
+
+| Engine | tok/s |
+|---|---:|
+| Inferno (GPU continuous batch) | 5185 |
+| vLLM 0.4.2 (same exported weights) | 2146 |
+| PyTorch serial KV decode | 574 |
+
+On a larger 4×512 model, **vLLM is ahead** (1709 vs 1352 tok/s) — Inferno's GEMMs are still naive float32. Batch scaling on mid is nearly linear from 1→16 sequences at almost constant wall time (~18 ms).
+
+### Earlier CPU login-node numbers
 
 Eight sequences, 12 prompt tokens and 12 new tokens each, greedy:
 
@@ -50,9 +63,7 @@ Eight sequences, 12 prompt tokens and 12 new tokens each, greedy:
 | Eight separate engines, summed | 6.50 s | same workload |
 | One sequence, full prefix recomputed for every new token | 0.203 s | 12 new tokens |
 
-Sharing one engine across the eight sequences took 3.6× less wall time than eight separate engines. At this model size, recomputing a single short sequence from scratch was faster than serving that sequence through the scheduler, so this run is a batching measurement, not a claim that the KV cache beats prefill here.
-
-Kernel microbenchmarks, same machine:
+Kernel microbenchmarks on that CPU:
 
 | Kernel | Result |
 |---|---|
@@ -60,10 +71,6 @@ Kernel microbenchmarks, same machine:
 | GEMM 256×256×256, tiled 32 | 99.5 ms, 0.34 GFLOP/s, max abs diff 0 |
 | Attention T=128, 8 heads, dim 32, full softmax | 1.49 ms |
 | Same attention, online softmax | 97.2 ms, max abs diff 1.6e-7 |
-
-The tiled GEMM matches the plain GEMM and is slower at this size. The online attention matches the full softmax numerically and is slower in this scalar CPU implementation.
-
-PyTorch and vLLM have not been timed. `scripts/compare_pytorch.py` loads an `INF1` file and prints one greedy next-token id when PyTorch is installed. vLLM does not read this checkpoint format.
 
 ## Build
 
@@ -99,9 +106,26 @@ curl -s http://127.0.0.1:8000/v1/completions \
 ## Layout
 
 ```
-include/inferno/          public headers
-src/                      scheduler, model, HTTP, CPU kernels
-kernels/cuda_kernels.cu   CUDA operators and graph replay
-tests/test_inferno.cpp    correctness tests
-scripts/compare_pytorch.py
+include/inferno/             public headers
+src/                         scheduler, model, HTTP, CPU kernels
+kernels/cuda_kernels.cu      CUDA operators and graph replay
+tests/test_inferno.cpp       correctness tests
+results/                     GPU sweep JSON
+RESULTS.md                   latest GPU experiment tables
+scripts/compare_bench.py     Inferno vs PyTorch / vLLM
+scripts/run_experiments.py   batch / length / model / cross-engine sweep
+scripts/compare_job.sh       GPU job that builds, installs torch, runs comparison
 ```
+
+## Compare against PyTorch / vLLM
+
+Same workload: 8 sequences × (12 prompt + 12 new), greedy. Use `head_dim=64` (or another vLLM-supported size) when including vLLM.
+
+```bash
+bash scripts/compare_job.sh
+# on an allocated GPU node with the compare venv:
+python3 scripts/compare_bench.py model.bin --inferno ./build-gpu/inferno
+python3 scripts/run_experiments.py
+```
+
+The scripts check that PyTorch matches Inferno token-for-token on sequence 0, time Inferno continuous batching against a PyTorch serial KV-cache decode, and time vLLM after exporting the INF1 weights as a tiny HuggingFace Llama directory.

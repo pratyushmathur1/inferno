@@ -1,4 +1,10 @@
 build/
+build-gpu/
+gpu-job.out
+compare-*.out
 *.bin
 *.o
 .cache/
+scripts/__pycache__/
+__pycache__/
+

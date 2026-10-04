@@ -1,6 +1,7 @@
 #include "inferno/model.hpp"
 
 #include "inferno/cpu_kernels.hpp"
+#include "inferno/cuda_api.hpp"
 
 #include <cmath>
 #include <fstream>
@@ -157,10 +158,17 @@ Model Model::load(const std::string& path) {
     return m;
 }
 
-void Model::forward(const std::vector<TokenIn>& tokens, PagedCache& cache, std::vector<float>& logits) {
+void Model::forward(const std::vector<TokenIn>& tokens, PagedCache& cache, std::vector<float>& logits,
+                    bool use_gpu, bool cuda_graphs, void** gpu) {
     const int T = static_cast<int>(tokens.size());
     logits.clear();
     if (T == 0) return;
+    if (use_gpu) {
+        if (!gpu) throw std::runtime_error("GPU forward needs a device slot");
+        cuda::llama_forward(cfg_, weights_.data(), static_cast<std::int64_t>(weights_.size()), layers_.data(),
+                            tokens, cache, logits, cuda_graphs, *gpu);
+        return;
+    }
     const int H = cfg_.hidden;
     const int Q = cfg_.q_dim();
     const int Kdim = cfg_.kv_dim();

@@ -32,6 +32,9 @@ endif()
 
 if(INFERNO_CUDA)
     enable_language(CUDA)
+    if(NOT CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES native)
+    endif()
     target_sources(inferno PRIVATE kernels/cuda_kernels.cu)
     target_compile_definitions(inferno PUBLIC INFERNO_USE_CUDA)
     set_property(TARGET inferno PROPERTY CUDA_STANDARD 17)
@@ -40,7 +43,7 @@ else()
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(inferno PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_compile_options(inferno PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>)
 endif()
 
 add_executable(inferno_cli src/main.cpp)

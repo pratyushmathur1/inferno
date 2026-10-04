@@ -81,6 +81,10 @@ void run_benchmarks() {
     cfg.num_blocks = 256;
     cfg.max_batched_tokens = 512;
     cfg.max_seqs = 16;
+    if (cuda::available()) {
+        cfg.use_cuda = true;
+        cfg.cuda_graphs = true;
+    }
 
     std::vector<Request> reqs;
     for (int i = 0; i < 8; ++i) {
@@ -148,6 +152,9 @@ void run_benchmarks() {
               << (1000.0 * gen_tokens / batched_ms) << " tok/s\n"
               << "  serial engines   " << serial_ms << " ms\n"
               << "  prefill-every-token (1 sequence) " << recompute_ms << " ms\n";
+    if (cfg.use_cuda) {
+        std::cout << "serve device gpu  graph_replays " << batched.device_replays() << "\n";
+    }
 
     if (cuda::available()) {
         float graph_ms = 0.f;

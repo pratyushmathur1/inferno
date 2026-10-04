@@ -328,7 +328,14 @@ void test_http_and_submit() {
     auto eb = gen(model, roomy(), {b});
     check(ra.tokens == ea[0].tokens && rb.tokens == eb[0].tokens, "live submit matches generate");
 
-    check(!inferno::cuda::available(), "cpu build reports cuda unavailable");
+    if (inferno::cuda::available()) {
+        inferno::EngineConfig gpu = roomy();
+        gpu.use_cuda = true;
+        gpu.cuda_graphs = true;
+        inferno::Request req{7, prompt_of(4, model.vocab(), 3), 4, 0.f, 1, 1};
+        auto out = gen(model, gpu, {req});
+        check(out.size() == 1 && out[0].ok && out[0].generated == 4, "gpu generate returns four tokens");
+    }
 }
 
 }  // namespace

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "inferno/cuda_api.hpp"
 #include "inferno/model.hpp"
 #include "inferno/scheduler.hpp"
 #include "inferno/types.hpp"
@@ -30,6 +31,7 @@ public:
     void start();
     void stop();
     std::future<GenerationResult> submit(Request req);
+    int device_replays() const { return cuda::graph_replays(device_); }
 
 private:
     void worker();
@@ -41,6 +43,7 @@ private:
     PagedCache cache_;
     Metrics last_metrics_{};
     mutable std::mutex metrics_mu_;
+    void* device_ = nullptr;
 
     std::mutex mu_;
     std::condition_variable cv_;

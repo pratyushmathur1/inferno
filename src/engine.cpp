@@ -11,13 +11,17 @@ Engine::Engine(Model model, EngineConfig cfg)
       cfg_(cfg),
       cache_(model_.config().n_layers, model_.config().n_kv_heads, model_.config().head_dim,
              cfg.num_blocks, cfg.block_size) {
-    if (cfg_.use_cuda && !cfg_.cuda_graphs) {
-        // Device selection is recorded for the CUDA graph path. Operator
-        // dispatch stays on the CPU reference until a CUDA build is linked.
+    if (cfg_.use_cuda && !cuda::available()) {
+        throw std::runtime_error(
+            "CUDA was requested, but this binary has no GPU runtime. Rebuild with -DINFERNO_CUDA=ON on a machine with nvcc.");
     }
 }
 
-Engine::~Engine() { stop(); }
+Engine::~Engine() {
+    stop();
+    cuda::release_device(device_);
+    device_ = nullptr;
+}
 
 std::vector<GenerationResult> Engine::generate(const std::vector<Request>& requests) {
     if (running_) throw std::runtime_error("stop the continuous-batching worker before generate()");
@@ -27,7 +31,7 @@ std::vector<GenerationResult> Engine::generate(const std::vector<Request>& reque
     while (sched.has_work()) {
         Step step = sched.prepare();
         std::vector<float> logits;
-        model_.forward(step.tokens, cache_, logits);
+        model_.forward(step.tokens, cache_, logits, cfg_.use_cuda, cfg_.cuda_graphs, &device_);
         sched.commit(step, logits.empty() ? nullptr : logits.data(), model_.vocab());
         auto done = sched.pop_finished();
         out.insert(out.end(), done.begin(), done.end());
@@ -41,7 +45,7 @@ std::vector<GenerationResult> Engine::generate(const std::vector<Request>& reque
 void Engine::step(Scheduler& sched) {
     Step step = sched.prepare();
     std::vector<float> logits;
-    model_.forward(step.tokens, cache_, logits);
+    model_.forward(step.tokens, cache_, logits, cfg_.use_cuda, cfg_.cuda_graphs, &device_);
     sched.commit(step, logits.empty() ? nullptr : logits.data(), model_.vocab());
     store_metrics(sched.metrics());
 }
