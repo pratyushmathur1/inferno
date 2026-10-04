@@ -35,7 +35,7 @@ public:
     // emit order, shape [num_emits, vocab].
     void forward(const std::vector<TokenIn>& tokens, PagedCache& cache,
                  std::vector<float>& logits, bool use_gpu = false, bool cuda_graphs = false,
-                 void** gpu = nullptr);
+                 void** gpu = nullptr, bool use_cublas = true, bool profile = false);
 
 private:
     const float* ptr(Span s) const;

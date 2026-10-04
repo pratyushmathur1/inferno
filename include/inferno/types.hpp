@@ -30,6 +30,8 @@ struct EngineConfig {
     int max_seqs = 32;
     bool use_cuda = false;
     bool cuda_graphs = false;
+    bool use_cublas = true;   // GPU only; false keeps the tiled teaching GEMM
+    bool profile_cuda = false;
 };
 
 struct Request {

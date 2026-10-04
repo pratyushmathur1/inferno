@@ -1,0 +1,47 @@
+{
+  "mid_cublas": {
+    "ms": 2.75895,
+    "gen": 96,
+    "tok_s": 34795.9,
+    "device": "gpu",
+    "gemm": "cublas",
+    "graph_replays": 20,
+    "tokens_match_tiled": true
+  },
+  "mid_tiled": {
+    "ms": 18.4879,
+    "gen": 96,
+    "tok_s": 5192.58,
+    "device": "gpu",
+    "gemm": "tiled",
+    "graph_replays": 20,
+    "tokens_match_tiled": true
+  },
+  "mid_cublas_nographs": {
+    "ms": 3.17936,
+    "gen": 96,
+    "tok_s": 30194.7,
+    "device": "gpu",
+    "gemm": "cublas",
+    "graph_replays": 0,
+    "tokens_match_tiled": true
+  },
+  "large_cublas": {
+    "ms": 7.98792,
+    "gen": 96,
+    "tok_s": 12018.2,
+    "device": "gpu",
+    "gemm": "cublas",
+    "graph_replays": 20,
+    "tokens_match_tiled": true
+  },
+  "large_tiled": {
+    "ms": 71.2031,
+    "gen": 96,
+    "tok_s": 1348.26,
+    "device": "gpu",
+    "gemm": "tiled",
+    "graph_replays": 20,
+    "tokens_match_tiled": true
+  }
+}

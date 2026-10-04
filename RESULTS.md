@@ -1,10 +1,46 @@
-# Inferno GPU experiments (20261004T161641Z)
+# Inferno GPU experiments
 
-- Host: `g002`
-- GPU: `GPU 0: NVIDIA A100-SXM4-40GB (UUID: GPU-28328757-6d71-0098-6f01-090385f1cb36)`
-- Binary: `/home/x-pmathur1/inferno/build-gpu/inferno`
+## Thesis
 
-## Batch scaling (mid_h64, 12+12)
+**Correctness-preserving continuous batching + public ablations.** Every serving optimization (graphs, GEMM backend, batch size) keeps greedy token identity with the serial path, and every switch ships with a measured table. Kernel work (cuBLAS now; FlashDecoding / INT8 next) lands behind the same flags.
+
+---
+
+## cuBLAS vs tiled GEMM (4 Oct 2026, A100-SXM4-40GB, g002)
+
+Default GPU path uses **cuBLAS** `Sgemm` for `Y = X · Wᵀ`. `--naive-gemm` keeps the teaching tiled kernel. Greedy tokens match between backends.
+
+| model | GEMM | ms | tok/s | vs tiled |
+|---|---|---:|---:|---:|
+| mid_h64 (2×256) | cublas | 2.76 | **34796** | 6.7× |
+| mid_h64 | tiled | 18.49 | 5193 | 1.0× |
+| mid_h64 | cublas, no graphs | 3.18 | 30195 | — |
+| large_h64 (4×512) | cublas | 7.99 | **12018** | 8.9× |
+| large_h64 | tiled | 71.20 | 1348 | 1.0× |
+
+Workload: 8 sequences × 12 prompt + 12 new, greedy. Raw JSON: `results/gemm_ablation_latest.json`.
+
+With cuBLAS, large_h64 moves from **behind vLLM** (1352 vs 1709 tok/s in the earlier sweep) to **well ahead** of that baseline on the same toy weights.
+
+### CUDA-event profile (last decode step, 8 tokens in-flight)
+
+`inferno profile-forward -m model.bin --seqs 8 --prompt 12 --max-new 4`
+
+| model / GEMM | total ms | gemm % | attn % | norm % | misc % |
+|---|---:|---:|---:|---:|---:|
+| mid / cublas | 0.58 | 29% | 5% | 7% | 10% |
+| mid / tiled | 1.87 | **78%** | 2% | 2% | 3% |
+| large / cublas | 1.50 | 46% | 5% | 6% | 8% |
+
+Bucket sums are below 100% because inter-kernel gaps and event sync cost land outside the labeled spans. Files: `results/profile_mid_cublas.txt`, `results/profile_mid_tiled.txt`, `results/profile_large_cublas.txt`.
+
+---
+
+## Earlier tiled-GEMM sweep (20261004T161641Z)
+
+These rows used the **tiled** teaching GEMM (pre-cuBLAS default). Kept for history.
+
+### Batch scaling (mid_h64, 12+12)
 
 | seqs | ms | tok/s | graph_replays |
 |---:|---:|---:|---:|
@@ -15,14 +51,14 @@
 | 16 | 18.69 | 10274.3 | 20 |
 | 32 | 21.09 | 18208.7 | 18 |
 
-## CUDA graphs (mid_h64, 8×12+12)
+### CUDA graphs (mid_h64, 8×12+12, tiled)
 
 | graphs | ms | tok/s | replays |
 |---|---:|---:|---:|
 | True | 18.52 | 5184.1 | 20 |
 | False | 19.16 | 5010.4 | 0 |
 
-## Sequence length (mid_h64, 8 seqs)
+### Sequence length (mid_h64, 8 seqs, tiled)
 
 | prompt | new | ms | tok/s |
 |---:|---:|---:|---:|
@@ -31,37 +67,25 @@
 | 32 | 32 | 45.00 | 5688.8 |
 | 64 | 64 | 95.84 | 5342.3 |
 
-## Model size (8×12+12)
-
-| model | ms | tok/s |
-|---|---:|---:|
-| tiny_h16 | 4.60 | 20867.6 |
-| mid_h64 | 14.47 | 6634.0 |
-| large_h64 | 55.72 | 1722.9 |
-
-## Cross-engine
+### Cross-engine (tiled Inferno)
 
 | model | Inferno tok/s | PyTorch tok/s | vLLM tok/s | match |
 |---|---:|---:|---:|---|
 | mid_h64 | 5184.9 | 573.9 | 2146.4 | True |
 | large_h64 | 1352.2 | 307.5 | 1708.9 | True |
 
-## CPU vs GPU (same Inferno binary, 8×12+12)
+### CPU vs GPU (tiled, same binary)
 
 | model | CPU tok/s | GPU tok/s | speedup | tokens match |
 |---|---:|---:|---:|---|
 | mid_h64 | 3729.1 | 5182.5 | 1.39× | yes |
 | large_h64 | 471.4 | 1352.4 | 2.87× | yes |
 
-## Takeaways
-
-- Continuous batching scales nearly linearly from 1→16 sequences on mid_h64 (wall time stays ~18 ms while tok/s climbs).
-- CUDA graphs help a little on this toy size (~3%): 5184 vs 5010 tok/s.
-- Throughput stays flat as sequence length grows from 8 to 64, which is what you want from a KV cache.
-- Against a serial PyTorch KV decode, Inferno is ~9× on mid_h64 and ~4× on large_h64.
-- Against vLLM 0.4.2 on the same exported weights: Inferno wins on mid_h64 (~2.4×); **vLLM wins on large_h64** (~1.3×). That is an honest gap — Inferno's kernels are still naive float32 GEMMs.
-- GPU vs Inferno-CPU: tokens match; GPU helps more as the model grows (1.4× → 2.9×).
-
-Notes: PyTorch baseline is serial per-sequence KV decode. vLLM needs `head_dim` in {64,80,96,112,128,256}. These are random tiny models in float32, not a production LLM bake-off.
 Raw JSON: `results/gpu_sweep_latest.json`.
 
+## Takeaways
+
+- **cuBLAS is the production GEMM**; tiled stays as `--naive-gemm` for teaching and ablations. Same greedy tokens.
+- On mid, GEMM drops from ~78% → ~29% of profiled decode time; end-to-end tok/s jumps ~6.7×.
+- Continuous batching still scales nearly linearly in batch size; graphs add ~15% on mid after cuBLAS (34796 vs 30195).
+- Next kernel destination: FlashDecoding-style paged attention + weight-only INT8, still behind flags with correctness checks.

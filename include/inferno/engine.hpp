@@ -32,6 +32,7 @@ public:
     void stop();
     std::future<GenerationResult> submit(Request req);
     int device_replays() const { return cuda::graph_replays(device_); }
+    cuda::Profile device_profile() const { return cuda::last_profile(device_); }
 
 private:
     void worker();

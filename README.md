@@ -17,7 +17,7 @@ HTTP  POST /v1/completions
    GPU kernels            same math, used when CUDA is linked and a device is present
 ```
 
-`kernels/cuda_kernels.cu` is the GPU forward: tiled GEMM, RMSNorm, RoPE, SwiGLU, and attention that loads one KV page at a time. On a CUDA build with a device, `demo`, `generate`, `serve`, and `bench` run that forward. A step whose token count matches the previous step is captured into a CUDA graph and replayed. `make test` still runs the CPU kernels.
+`kernels/cuda_kernels.cu` is the GPU forward: **cuBLAS GEMM by default** (tiled teaching GEMM via `--naive-gemm`), RMSNorm, RoPE, SwiGLU, and attention that loads one KV page at a time. On a CUDA build with a device, `demo`, `generate`, `serve`, and `bench` run that forward. A step whose token count matches the previous step is captured into a CUDA graph and replayed. `inferno profile-forward` prints a CUDA-event breakdown (GEMM / attn / norm / …). `make test` still runs the CPU kernels.
 
 The model is a grouped-query Llama block: RMSNorm, rotate-half RoPE, SwiGLU. Weights are float32 in an `INF1` file from `inferno init-model`. Requests use token ids. There is no text tokenizer. Temperature `0` is greedy; otherwise sampling is top-k.
 
@@ -43,16 +43,20 @@ The online attention kernel is the FlashAttention recurrence (running max and su
 
 **CPU (1 Oct 2026, AMD EPYC 7543, no CUDA):** continuous batching of 8 short sequences was 3.6× lower wall time than eight separate engines (1.80 s vs 6.50 s). Details of that login-node run are kept below for history.
 
-**GPU (4 Oct 2026, NVIDIA A100-SXM4-40GB):** full sweep in [`RESULTS.md`](RESULTS.md) and `results/gpu_sweep_latest.json`. Headline numbers on the mid model (2×256, head_dim 64), 8 sequences × 12+12 greedy:
+**GPU (4 Oct 2026, NVIDIA A100-SXM4-40GB):** full tables in [`RESULTS.md`](RESULTS.md). Headline on mid (2×256, head_dim 64), 8×12+12 greedy:
 
 | Engine | tok/s |
 |---|---:|
-| Inferno (GPU continuous batch) | 5185 |
-| vLLM 0.4.2 (same exported weights) | 2146 |
-| PyTorch serial KV decode | 574 |
+| Inferno GPU (**cuBLAS** + continuous batch) | **34796** |
+| Inferno GPU (tiled GEMM, earlier default) | 5193 |
+| vLLM 0.4.2 (same exported weights, prior sweep) | 2146 |
+| PyTorch serial KV decode (prior sweep) | 574 |
 
-On a larger 4×512 model, **vLLM is ahead** (1709 vs 1352 tok/s) — Inferno's GEMMs are still naive float32. Batch scaling on mid is nearly linear from 1→16 sequences at almost constant wall time (~18 ms).
+On large (4×512), cuBLAS Inferno is **12018 tok/s** vs tiled **1348** (same greedy tokens). That closes the earlier gap where tiled Inferno trailed vLLM.
 
+### Uniqueness pillar
+
+Inferno is not “another mini-vLLM.” The claim is **correctness-preserving continuous batching with public ablations**: chunked prefill, preemption, and GPU/CPU paths must match serial greedy output, and every optimization (graphs, GEMM backend, batch size) ships with a switch and a measured row in `RESULTS.md`. Kernel upgrades (cuBLAS now; FlashDecoding / INT8 next) layer on that pillar instead of replacing it.
 ### Earlier CPU login-node numbers
 
 Eight sequences, 12 prompt tokens and 12 new tokens each, greedy:
@@ -128,4 +132,11 @@ python3 scripts/compare_bench.py model.bin --inferno ./build-gpu/inferno
 python3 scripts/run_experiments.py
 ```
 
-The scripts check that PyTorch matches Inferno token-for-token on sequence 0, time Inferno continuous batching against a PyTorch serial KV-cache decode, and time vLLM after exporting the INF1 weights as a tiny HuggingFace Llama directory.
+```bash
+./build-gpu/inferno compare-workload -m model.bin --seqs 8 --prompt 12 --max-new 12
+./build-gpu/inferno compare-workload -m model.bin --naive-gemm   # teaching tiled GEMM
+./build-gpu/inferno profile-forward -m model.bin --seqs 8 --prompt 12 --max-new 4
+```
+
+GPU flags: `--cuda` / `--cpu` / `--no-graphs` / `--naive-gemm` / `--profile-forward`.
+

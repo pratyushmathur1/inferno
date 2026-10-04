@@ -7,6 +7,7 @@
 
 #include "inferno/cuda_api.hpp"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -31,7 +32,22 @@ void check(cudaError_t st, const char* what) {
     }
 }
 
+void check_cublas(cublasStatus_t st, const char* what) {
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(std::string(what) + ": cublas status " + std::to_string(static_cast<int>(st)));
+    }
+}
+
 #define CHECK(call) ::inferno::cuda::check((call), #call)
+
+// Row-major Y[M,N] = X[M,K] · W[N,K]^T via cuBLAS (column-major API).
+void gemm_cublas(cublasHandle_t handle, const float* X, const float* W, float* Y, int M, int N, int K,
+                 cudaStream_t stream) {
+    check_cublas(cublasSetStream(handle, stream), "cublasSetStream");
+    const float alpha = 1.f, beta = 0.f;
+    check_cublas(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, W, K, X, K, &beta, Y, N),
+                 "cublasSgemm");
+}
 
 __global__ void gemm_nt(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
                         int M, int N, int K) {
@@ -216,7 +232,7 @@ __global__ void paged_attn_kernel(const float* q, const float* kcache, const flo
     for (int d = threadIdx.x; d < dim; d += blockDim.x) oo[d] = acc[d] * inv;
 }
 
-void gemm(const float* A, const float* B, float* C, int M, int N, int K, cudaStream_t stream) {
+void gemm_tiled(const float* A, const float* B, float* C, int M, int N, int K, cudaStream_t stream) {
     dim3 block(kTile, kTile);
     dim3 grid((N + kTile - 1) / kTile, (M + kTile - 1) / kTile);
     gemm_nt<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
@@ -226,6 +242,25 @@ void launch_rmsnorm(const float* x, const float* w, float* y, int rows, int dim,
     rmsnorm_kernel<<<rows, 128, 0, stream>>>(x, w, y, rows, dim, eps);
 }
 
+struct EventPair {
+    cudaEvent_t a = nullptr;
+    cudaEvent_t b = nullptr;
+    void create() {
+        check(cudaEventCreate(&a), "event");
+        check(cudaEventCreate(&b), "event");
+    }
+    void destroy() {
+        if (a) cudaEventDestroy(a);
+        if (b) cudaEventDestroy(b);
+        a = b = nullptr;
+    }
+    float ms() const {
+        float t = 0.f;
+        check(cudaEventElapsedTime(&t, a, b), "elapsed");
+        return t;
+    }
+};
+
 struct Runner {
     ModelConfig cfg{};
     int max_t = 0;
@@ -234,11 +269,14 @@ struct Runner {
     int table_stride = 0;
     long long layer_stride = 0;
     cudaStream_t stream = nullptr;
+    cublasHandle_t blas = nullptr;
+    bool use_cublas = true;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
     int exec_t = -1;
     int last_t = -2;
     int replays = 0;
+    Profile last{};
 
     float* weights = nullptr;
     float* kcache = nullptr;
@@ -283,6 +321,7 @@ struct Runner {
         freef(positions);
         freef(seq_compact);
         freef(tables);
+        if (blas) cublasDestroy(blas);
         if (stream) cudaStreamDestroy(stream);
     }
 
@@ -294,6 +333,10 @@ struct Runner {
         exec_t = -1;
     }
 
+    void gemm(const float* A, const float* B, float* C, int M, int N, int K, cudaStream_t s) {
+        if (use_cublas) gemm_cublas(blas, A, B, C, M, N, K, s);
+        else gemm_tiled(A, B, C, M, N, K, s);
+    }
 };
 
 struct Live : Runner {
@@ -341,6 +384,128 @@ struct Live : Runner {
         launch_rmsnorm(x, weights + final_rms.off, xn, T, H, cfg.rms_eps, s);
         gemm(xn, weights + lm_head.off, logits, T, cfg.vocab, H, s);
     }
+
+    // Instrument one forward with CUDA events (disables graph replay).
+    Profile launch_profiled(int T, cudaStream_t s) {
+        Profile p;
+        p.tokens = T;
+        p.layers = cfg.n_layers;
+        p.gemm_backend = use_cublas ? "cublas" : "tiled";
+        const int H = cfg.hidden;
+        const int Qdim = cfg.n_heads * cfg.head_dim;
+        const int Kdim = cfg.n_kv_heads * cfg.head_dim;
+        const int I = cfg.intermediate;
+        const int dim = cfg.head_dim;
+        auto blocks = [](int n) { return (n + 255) / 256; };
+
+        EventPair total, emb, gemm_e, norm_e, rope_e, kv_e, attn_e, misc_e;
+        total.create();
+        emb.create();
+        gemm_e.create();
+        norm_e.create();
+        rope_e.create();
+        kv_e.create();
+        attn_e.create();
+        misc_e.create();
+
+        auto finish = [&](EventPair& e, float& bucket) {
+            check(cudaEventRecord(e.b, s), "rec");
+            check(cudaEventSynchronize(e.b), "sync bucket");
+            bucket += e.ms();
+        };
+
+        check(cudaEventRecord(total.a, s), "rec");
+        check(cudaEventRecord(emb.a, s), "rec");
+        embed_kernel<<<T, 128, 0, s>>>(token_ids, weights + tok_emb.off, x, H);
+        finish(emb, p.embed_ms);
+
+        for (int layer = 0; layer < cfg.n_layers; ++layer) {
+            const LayerOff& off = layers[layer];
+            check(cudaEventRecord(misc_e.a, s), "rec");
+            copy_kernel<<<blocks(T * H), 256, 0, s>>>(x, residual, T * H);
+            finish(misc_e, p.misc_ms);
+
+            check(cudaEventRecord(norm_e.a, s), "rec");
+            launch_rmsnorm(x, weights + off.rms1.off, xn, T, H, cfg.rms_eps, s);
+            finish(norm_e, p.norm_ms);
+
+            check(cudaEventRecord(gemm_e.a, s), "rec");
+            gemm(xn, weights + off.wq.off, q, T, Qdim, H, s);
+            gemm(xn, weights + off.wk.off, k, T, Kdim, H, s);
+            gemm(xn, weights + off.wv.off, v, T, Kdim, H, s);
+            finish(gemm_e, p.gemm_ms);
+
+            check(cudaEventRecord(rope_e.a, s), "rec");
+            rope_kernel<<<dim3(T, cfg.n_heads), dim / 2, 0, s>>>(q, positions, T, cfg.n_heads, dim, cfg.rope_theta);
+            rope_kernel<<<dim3(T, cfg.n_kv_heads), dim / 2, 0, s>>>(k, positions, T, cfg.n_kv_heads, dim, cfg.rope_theta);
+            finish(rope_e, p.rope_ms);
+
+            check(cudaEventRecord(kv_e.a, s), "rec");
+            write_kv_kernel<<<dim3(T, cfg.n_kv_heads), dim, 0, s>>>(
+                k, v, kcache, vcache, tables, seq_compact, positions, table_stride, cfg.n_kv_heads, block_size, dim,
+                layer_stride * layer);
+            finish(kv_e, p.kv_write_ms);
+
+            check(cudaEventRecord(attn_e.a, s), "rec");
+            const int smem = 2 * block_size * dim * static_cast<int>(sizeof(float));
+            paged_attn_kernel<<<dim3(T, cfg.n_heads), 128, smem, s>>>(
+                q, kcache, vcache, tables, seq_compact, positions, attn, table_stride, cfg.n_heads, cfg.n_kv_heads,
+                block_size, dim, layer_stride * layer);
+            finish(attn_e, p.attn_ms);
+
+            check(cudaEventRecord(gemm_e.a, s), "rec");
+            gemm(attn, weights + off.wo.off, proj, T, H, Qdim, s);
+            finish(gemm_e, p.gemm_ms);
+
+            check(cudaEventRecord(misc_e.a, s), "rec");
+            add_kernel<<<blocks(T * H), 256, 0, s>>>(residual, proj, x, T * H);
+            copy_kernel<<<blocks(T * H), 256, 0, s>>>(x, residual, T * H);
+            finish(misc_e, p.misc_ms);
+
+            check(cudaEventRecord(norm_e.a, s), "rec");
+            launch_rmsnorm(x, weights + off.rms2.off, xn, T, H, cfg.rms_eps, s);
+            finish(norm_e, p.norm_ms);
+
+            check(cudaEventRecord(gemm_e.a, s), "rec");
+            gemm(xn, weights + off.wgate.off, gate, T, I, H, s);
+            gemm(xn, weights + off.wup.off, up, T, I, H, s);
+            finish(gemm_e, p.gemm_ms);
+
+            check(cudaEventRecord(misc_e.a, s), "rec");
+            silu_mul_kernel<<<blocks(T * I), 256, 0, s>>>(gate, up, mid, T * I);
+            finish(misc_e, p.misc_ms);
+
+            check(cudaEventRecord(gemm_e.a, s), "rec");
+            gemm(mid, weights + off.wdown.off, proj, T, H, I, s);
+            finish(gemm_e, p.gemm_ms);
+
+            check(cudaEventRecord(misc_e.a, s), "rec");
+            add_kernel<<<blocks(T * H), 256, 0, s>>>(residual, proj, x, T * H);
+            finish(misc_e, p.misc_ms);
+        }
+
+        check(cudaEventRecord(norm_e.a, s), "rec");
+        launch_rmsnorm(x, weights + final_rms.off, xn, T, H, cfg.rms_eps, s);
+        finish(norm_e, p.norm_ms);
+
+        check(cudaEventRecord(gemm_e.a, s), "rec");
+        gemm(xn, weights + lm_head.off, logits, T, cfg.vocab, H, s);
+        finish(gemm_e, p.gemm_ms);
+
+        check(cudaEventRecord(total.b, s), "rec");
+        check(cudaEventSynchronize(total.b), "sync total");
+        p.total_ms = total.ms();
+
+        total.destroy();
+        emb.destroy();
+        gemm_e.destroy();
+        norm_e.destroy();
+        rope_e.destroy();
+        kv_e.destroy();
+        attn_e.destroy();
+        misc_e.destroy();
+        return p;
+    }
 };
 
 void* must_alloc(size_t bytes) {
@@ -368,13 +533,13 @@ bool graph_replay_bench(int M, int N, int K, int iters, float& ms_out) {
     check(cudaMemset(w, 0, sizeof(float) * static_cast<size_t>(N)), "memset w");
     cudaStream_t stream = nullptr;
     check(cudaStreamCreate(&stream), "stream");
-    gemm(a, b, c, M, N, K, stream);
+    gemm_tiled(a, b, c, M, N, K, stream);
     launch_rmsnorm(c, w, a, M, N, 1e-5f, stream);
     check(cudaStreamSynchronize(stream), "warmup");
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
     check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "begin capture");
-    gemm(a, b, c, M, N, K, stream);
+    gemm_tiled(a, b, c, M, N, K, stream);
     launch_rmsnorm(c, w, a, M, N, 1e-5f, stream);
     check(cudaStreamEndCapture(stream, &graph), "end capture");
 #if CUDART_VERSION >= 12000
@@ -409,9 +574,14 @@ int graph_replays(void* slot) {
     return static_cast<Live*>(slot)->replays;
 }
 
+Profile last_profile(void* slot) {
+    if (!slot) return {};
+    return static_cast<Live*>(slot)->last;
+}
+
 void llama_forward(const ModelConfig& cfg, const float* weights, std::int64_t nweights, const LayerOff* layers,
-                   const std::vector<TokenIn>& tokens, PagedCache& cache, std::vector<float>& logits, bool graphs,
-                   void*& slot) {
+                   const std::vector<TokenIn>& tokens, PagedCache& cache, std::vector<float>& logits,
+                   ForwardOptions opts, void*& slot) {
     const int T = static_cast<int>(tokens.size());
     logits.clear();
     if (T == 0) return;
@@ -427,6 +597,11 @@ void llama_forward(const ModelConfig& cfg, const float* weights, std::int64_t nw
     if (!slot) slot = new Live();
     Live& dev = *static_cast<Live*>(slot);
     if (!dev.stream) check(cudaStreamCreate(&dev.stream), "stream");
+    if (!dev.blas) check_cublas(cublasCreate(&dev.blas), "cublasCreate");
+    if (dev.use_cublas != opts.use_cublas) {
+        dev.use_cublas = opts.use_cublas;
+        dev.drop_graph();
+    }
 
     const bool shape_changed = dev.num_blocks != cache.num_blocks() || dev.block_size != cache.block_size() ||
                                dev.cfg.n_layers != cfg.n_layers || dev.cfg.n_kv_heads != cfg.n_kv_heads ||
@@ -532,29 +707,38 @@ void llama_forward(const ModelConfig& cfg, const float* weights, std::int64_t nw
     check(cudaMemcpyAsync(dev.tables, packed.data(), sizeof(int) * packed.size(), cudaMemcpyHostToDevice, dev.stream),
           "tables");
 
-    const bool replay = graphs && dev.exec && dev.exec_t == T;
-    if (replay) {
-        check(cudaGraphLaunch(dev.exec, dev.stream), "graph launch");
-        ++dev.replays;
+    const bool want_graphs = opts.graphs && !opts.profile;
+    if (opts.profile) {
+        dev.last = dev.launch_profiled(T, dev.stream);
+        check(cudaGetLastError(), "profiled launch");
     } else {
-        dev.launch(T, dev.stream);
-        check(cudaGetLastError(), "kernel launch");
-        if (graphs && dev.last_t == T) {
-            check(cudaStreamSynchronize(dev.stream), "sync before capture");
-            dev.drop_graph();
-            check(cudaStreamBeginCapture(dev.stream, cudaStreamCaptureModeGlobal), "begin capture");
+        const bool replay = want_graphs && dev.exec && dev.exec_t == T;
+        if (replay) {
+            check(cudaGraphLaunch(dev.exec, dev.stream), "graph launch");
+            ++dev.replays;
+        } else {
             dev.launch(T, dev.stream);
-            check(cudaStreamEndCapture(dev.stream, &dev.graph), "end capture");
+            check(cudaGetLastError(), "kernel launch");
+            if (want_graphs && dev.last_t == T) {
+                check(cudaStreamSynchronize(dev.stream), "sync before capture");
+                dev.drop_graph();
+                check(cudaStreamBeginCapture(dev.stream, cudaStreamCaptureModeGlobal), "begin capture");
+                dev.launch(T, dev.stream);
+                check(cudaStreamEndCapture(dev.stream, &dev.graph), "end capture");
 #if CUDART_VERSION >= 12000
-            check(cudaGraphInstantiate(&dev.exec, dev.graph, 0), "instantiate");
+                check(cudaGraphInstantiate(&dev.exec, dev.graph, 0), "instantiate");
 #else
-            check(cudaGraphInstantiate(&dev.exec, dev.graph, nullptr, nullptr, 0), "instantiate");
+                check(cudaGraphInstantiate(&dev.exec, dev.graph, nullptr, nullptr, 0), "instantiate");
 #endif
-            dev.exec_t = T;
+                dev.exec_t = T;
+            }
+        }
+        check(cudaStreamSynchronize(dev.stream), "sync forward");
+        if (!opts.profile) {
+            // keep last profile only from explicit profile runs
         }
     }
     dev.last_t = T;
-    check(cudaStreamSynchronize(dev.stream), "sync forward");
 
     std::vector<float> all(static_cast<size_t>(T) * cfg.vocab);
     check(cudaMemcpy(all.data(), dev.logits, sizeof(float) * all.size(), cudaMemcpyDeviceToHost), "logits");

@@ -5,6 +5,7 @@
 #include "inferno/server.hpp"
 
 #include <chrono>
+#include <cstring>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -21,7 +22,9 @@ void usage() {
         << "  inferno init-model -o model.bin [--seed N] [--layers N] [--hidden N] [--vocab N] [--head-dim N]\n"
         << "  inferno generate -m model.bin --tokens 1,2,3 --max-new 16 [--temp 0] [--cpu]\n"
         << "  inferno compare-workload -m model.bin [--seqs 8] [--prompt 12] [--max-new 12] [--cpu]\n"
-        << "  inferno serve -m model.bin [--port 8000] [--cpu]\n";
+        << "  inferno profile-forward -m model.bin [--seqs 8] [--prompt 12] [--max-new 4] [--naive-gemm]\n"
+        << "  inferno serve -m model.bin [--port 8000] [--cpu]\n"
+        << "\nGPU flags: --cuda | --cpu | --no-graphs | --naive-gemm | --profile-forward\n";
 }
 
 std::vector<int> parse_tokens(const std::string& s) {
@@ -103,6 +106,8 @@ int main(int argc, char** argv) {
         float temp = 0.f;
         bool want_cuda = inferno::cuda::available();
         bool graphs = true;
+        bool use_cublas = true;
+        bool profile_cuda = false;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             if (a == "-m" || a == "--model") model_path = need(i, argc, argv, a);
@@ -121,6 +126,8 @@ int main(int argc, char** argv) {
             else if (a == "--cpu") want_cuda = false;
             else if (a == "--cuda") want_cuda = true;
             else if (a == "--no-graphs") graphs = false;
+            else if (a == "--naive-gemm") use_cublas = false;
+            else if (a == "--profile-forward") profile_cuda = true;
             else throw std::runtime_error("unknown flag " + a);
         }
         if (cmd == "init-model") {
@@ -149,7 +156,9 @@ int main(int argc, char** argv) {
         inferno::Model model = inferno::Model::load(model_path);
         inferno::EngineConfig ecfg;
         ecfg.use_cuda = want_cuda;
-        ecfg.cuda_graphs = want_cuda && graphs;
+        ecfg.cuda_graphs = want_cuda && graphs && !profile_cuda && cmd != "profile-forward";
+        ecfg.use_cublas = use_cublas;
+        ecfg.profile_cuda = profile_cuda || cmd == "profile-forward";
         inferno::Engine engine(model, ecfg);
         if (cmd == "generate") {
             inferno::Request req;
@@ -197,6 +206,7 @@ int main(int argc, char** argv) {
             std::cout << "COMPARE {";
             std::cout << "\"ms\":" << ms << ",\"gen\":" << gen << ",\"tok_s\":" << tok_s
                       << ",\"device\":\"" << (ecfg.use_cuda ? "gpu" : "cpu") << "\""
+                      << ",\"gemm\":\"" << (ecfg.use_cublas ? "cublas" : "tiled") << "\""
                       << ",\"graph_replays\":" << engine.device_replays()
                       << ",\"sequences\":[";
             for (std::size_t i = 0; i < out.size(); ++i) {
@@ -216,6 +226,55 @@ int main(int argc, char** argv) {
                 std::cout << "]}";
             }
             std::cout << "]}\n";
+            return 0;
+        }
+        if (cmd == "profile-forward") {
+            if (!ecfg.use_cuda) throw std::runtime_error("profile-forward needs GPU (--cuda)");
+            if (seqs < 1 || prompt_len < 1) throw std::runtime_error("bad profile sizes");
+            std::vector<inferno::Request> reqs;
+            for (int i = 0; i < seqs; ++i) {
+                inferno::Request r;
+                r.id = i;
+                r.prompt.resize(prompt_len);
+                for (int j = 0; j < prompt_len; ++j) {
+                    r.prompt[j] = (i * 3 + j) % model.vocab();
+                }
+                r.max_new_tokens = std::max(1, max_new);
+                r.temperature = 0.f;
+                reqs.push_back(r);
+            }
+            engine.generate(reqs);  // upload + one profiled pass
+            auto p = engine.device_profile();
+            auto pct = [&](float ms) {
+                return p.total_ms > 0.f ? (100.f * ms / p.total_ms) : 0.f;
+            };
+            std::cout << "PROFILE {\n"
+                      << "  \"gemm\":\"" << p.gemm_backend << "\",\n"
+                      << "  \"tokens\":" << p.tokens << ",\"layers\":" << p.layers << ",\n"
+                      << "  \"total_ms\":" << p.total_ms << ",\n"
+                      << "  \"embed_ms\":" << p.embed_ms << ",\"embed_pct\":" << pct(p.embed_ms) << ",\n"
+                      << "  \"gemm_ms\":" << p.gemm_ms << ",\"gemm_pct\":" << pct(p.gemm_ms) << ",\n"
+                      << "  \"norm_ms\":" << p.norm_ms << ",\"norm_pct\":" << pct(p.norm_ms) << ",\n"
+                      << "  \"rope_ms\":" << p.rope_ms << ",\"rope_pct\":" << pct(p.rope_ms) << ",\n"
+                      << "  \"kv_write_ms\":" << p.kv_write_ms << ",\"kv_write_pct\":" << pct(p.kv_write_ms) << ",\n"
+                      << "  \"attn_ms\":" << p.attn_ms << ",\"attn_pct\":" << pct(p.attn_ms) << ",\n"
+                      << "  \"misc_ms\":" << p.misc_ms << ",\"misc_pct\":" << pct(p.misc_ms) << "\n"
+                      << "}\n";
+            std::cout << "\n  op           ms      %\n"
+                      << "  ---------- ------ ------\n";
+            auto row = [&](const char* name, float ms) {
+                std::cout << "  " << name;
+                for (int i = static_cast<int>(std::strlen(name)); i < 10; ++i) std::cout << ' ';
+                std::cout << ' ' << ms << "  " << pct(ms) << "\n";
+            };
+            row("embed", p.embed_ms);
+            row("gemm", p.gemm_ms);
+            row("norm", p.norm_ms);
+            row("rope", p.rope_ms);
+            row("kv_write", p.kv_write_ms);
+            row("attn", p.attn_ms);
+            row("misc", p.misc_ms);
+            row("TOTAL", p.total_ms);
             return 0;
         }
         if (cmd == "serve") {
