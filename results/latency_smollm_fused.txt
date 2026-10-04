@@ -1,0 +1,1 @@
+LATENCY {"wall_ms":35.4928,"ttft_ms":6.21403,"itl_ms":3.2532,"new_tokens":10,"tok_s":281.747,"gpu_mem_mb":1742.06,"fuse":true,"device":"gpu"}

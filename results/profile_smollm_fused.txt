@@ -1,0 +1,24 @@
+PROFILE {
+  "gemm":"cublas",
+  "fused":true,
+  "tokens":1,"layers":30,
+  "total_ms":6.74099,
+  "embed_ms":0.007168,"embed_pct":0.106335,
+  "gemm_ms":2.1545,"gemm_pct":31.9611,
+  "norm_ms":0.57344,"norm_pct":8.50676,
+  "rope_ms":0.288768,"rope_pct":4.28376,
+  "kv_write_ms":0.177152,"kv_write_pct":2.62798,
+  "attn_ms":0.726016,"attn_pct":10.7702,
+  "misc_ms":0.32256,"misc_pct":4.78505
+}
+
+  op           ms      %
+  ---------- ------ ------
+  embed      0.007168  0.106335
+  gemm       2.1545  31.9611
+  norm       0.57344  8.50676
+  rope       0.288768  4.28376
+  kv_write   0.177152  2.62798
+  attn       0.726016  10.7702
+  misc       0.32256  4.78505
+  TOTAL      6.74099  100

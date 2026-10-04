@@ -1,0 +1,49 @@
+{
+  "prompt": "Explain continuous batching in two sentences.",
+  "prompt_tokens": 38,
+  "max_new": 64,
+  "hf": "/anvil/scratch/x-pmathur1/hf/SmolLM2-135M-Instruct",
+  "inf1": "/anvil/scratch/x-pmathur1/inferno-models/smollm2-135m.inf1",
+  "results": [
+    {
+      "wall_ms": 96.6147,
+      "ttft_ms": 8.47499,
+      "itl_ms": 3.38999,
+      "new_tokens": 27,
+      "tok_s": 279.461,
+      "gpu_mem_mb": 1744.06,
+      "fuse": true,
+      "device": "gpu",
+      "engine": "inferno"
+    },
+    {
+      "wall_ms": 92.3438,
+      "ttft_ms": 6.96465,
+      "itl_ms": 3.28381,
+      "new_tokens": 27,
+      "tok_s": 292.386,
+      "gpu_mem_mb": 1746.06,
+      "fuse": false,
+      "device": "gpu",
+      "engine": "inferno"
+    },
+    {
+      "engine": "pytorch",
+      "wall_ms": 770.4012119211257,
+      "ttft_ms": 30.00069409608841,
+      "itl_ms": 28.47694299327066,
+      "tok_s": 35.04667383981774,
+      "new_tokens": 27,
+      "gpu_mem_mb": 336.31103515625
+    },
+    {
+      "engine": "vllm",
+      "wall_ms": 169.2788410000503,
+      "ttft_ms": 14.578373869881034,
+      "itl_ms": 2.4555629703201474,
+      "tok_s": 378.07442218948665,
+      "new_tokens": 64,
+      "gpu_mem_mb": 19543.2392578125
+    }
+  ]
+}

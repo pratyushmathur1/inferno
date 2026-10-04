@@ -1,0 +1,1 @@
+Paged attention is a type of attention that involves paying close attention to a specific piece of information, often in a single session, to ensure it is relevant and useful.

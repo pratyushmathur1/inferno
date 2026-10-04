@@ -20,17 +20,34 @@ Source: `HuggingFaceTB/SmolLM2-135M-Instruct` → `scripts/hf_to_inf1.py` (FP32 
 
 Greedy match vs HuggingFace FP32 on a chat prompt (8 new): **identical** token ids (`Hello!<|im_end|>`).
 
-### Latency vs PyTorch (`results/serious_bench.json`)
+### Latency vs PyTorch / vLLM (`results/serious_bench_vllm.json`)
 
-Chat prompt “Explain continuous batching in two sentences.”, max_new=32 (27 emitted). Inferno via in-process `bench-latency` (warmup excludes load).
+Chat prompt “Explain continuous batching in two sentences.”, max_new=64. Inferno/PyTorch stop at EOS (~27 new); vLLM ran the full 64 — tok/s is not perfectly matched on length.
 
-| Engine | tok/s | TTFT ms | ITL ms | GPU mem MB |
-|---|---:|---:|---:|---:|
-| Inferno FP32 cuBLAS fused | **278** | **7.9** | **3.4** | 1744 |
-| Inferno FP32 cuBLAS unfused | 291 | 7.6 | 3.3 | 1746 |
-| PyTorch FP16 `generate` | 36 | 30.5 | 27.9 | 336 |
+| Engine | tok/s | TTFT ms | ITL ms | GPU mem MB | new |
+|---|---:|---:|---:|---:|---:|
+| Inferno FP32 cuBLAS | **279** | **8.5** | 3.4 | 1744 | 27 |
+| PyTorch FP16 | 35 | 30.0 | 28.5 | 336 | 27 |
+| vLLM 0.4.2 FP16 | **378** | 14.6 | **2.5** | 19543 | 64 |
 
-Single-sequence fuse noise can flip ±a few %; the event profiles below are the clearer fusion signal.
+### SmolLM2 batch scaling (random prompts, 32 new)
+
+| seqs | ms | tok/s |
+|---:|---:|---:|
+| 1 | 117 | 274 |
+| 2 | 133 | 480 |
+| 4 | 132 | 972 |
+| 8 | 198 | 1292 |
+
+### Fuse on real model (CUDA-event, 1 token decode)
+
+| path | total ms | misc % |
+|---|---:|---:|
+| fused | **6.74** | **4.8** |
+| `--no-fuse` | 8.80 | 9.9 |
+
+Files: `results/profile_smollm_*.txt`, `results/latency_smollm_*.txt`.
+
 
 ### Speculative decoding
 
