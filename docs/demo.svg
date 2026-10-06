@@ -5,24 +5,24 @@
   <circle cx="22" cy="18" r="6" fill="#ff5f56"/>
   <circle cx="42" cy="18" r="6" fill="#ffbd2e"/>
   <circle cx="62" cy="18" r="6" fill="#27c93f"/>
-  <text x="90" y="22" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">inferno  text demo + serve</text>
+  <text x="90" y="22" fill="#8b949e" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12">inferno - text demo + serve</text>
 
-  <text x="20" y="64" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">$</text>
-  <text x="36" y="64" fill="#c9d1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">python3 scripts/generate_text.py \</text>
-  <text x="36" y="84" fill="#c9d1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">  -m models/smollm2-135m.inf1 --hf HuggingFaceTB/SmolLM2-135M-Instruct \</text>
-  <text x="36" y="104" fill="#c9d1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">  --prompt "Say hello in one short sentence." --chat --max-new 32</text>
+  <text x="20" y="64" fill="#8b949e" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13">$</text>
+  <text x="36" y="64" fill="#c9d1d9" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13">python3 scripts/generate_text.py \</text>
+  <text x="36" y="84" fill="#c9d1d9" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13">  -m models/smollm2-135m.inf1 --hf HuggingFaceTB/SmolLM2-135M-Instruct \</text>
+  <text x="36" y="104" fill="#c9d1d9" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13">  --prompt "Say hello in one short sentence." --chat --max-new 32</text>
 
-  <text x="36" y="132" fill="#3fb950" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">Hello!</text>
+  <text x="36" y="132" fill="#3fb950" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13">Hello!</text>
 
-  <text x="20" y="164" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">$</text>
-  <text x="36" y="164" fill="#c9d1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">./build-gpu/inferno serve -m models/smollm2-135m.inf1 --port 8000</text>
-  <text x="36" y="184" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">listening on :8000</text>
+  <text x="20" y="164" fill="#8b949e" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13">$</text>
+  <text x="36" y="164" fill="#c9d1d9" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13">./build-gpu/inferno serve -m models/smollm2-135m.inf1 --port 8000</text>
+  <text x="36" y="184" fill="#8b949e" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13">listening on :8000</text>
 
-  <text x="20" y="216" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">$</text>
-  <text x="36" y="216" fill="#c9d1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">curl -s localhost:8000/v1/completions -H 'content-type: application/json' \</text>
-  <text x="36" y="236" fill="#c9d1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">  -d '{"token_ids":[1,5,9,12],"max_tokens":8,"temperature":0}'</text>
+  <text x="20" y="216" fill="#8b949e" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13">$</text>
+  <text x="36" y="216" fill="#c9d1d9" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13">curl -s localhost:8000/v1/completions -H 'content-type: application/json' \</text>
+  <text x="36" y="236" fill="#c9d1d9" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13">  -d '{"token_ids":[1,5,9,12],"max_tokens":8,"temperature":0}'</text>
 
-  <text x="36" y="264" fill="#79c0ff" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">{"ok":true,"generated":8,"token_ids":[&]}</text>
+  <text x="36" y="264" fill="#79c0ff" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13">{"ok":true,"generated":8,"token_ids":[...]}</text>
 
-  <text x="20" y="300" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">SmolLM2-135M · greedy matches HuggingFace FP32 · A100 benches in RESULTS.md</text>
+  <text x="20" y="300" fill="#8b949e" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12">SmolLM2-135M - greedy matches HuggingFace FP32 - A100 benches in RESULTS.md</text>
 </svg>
