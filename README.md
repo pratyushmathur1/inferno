@@ -1,6 +1,5 @@
 # Inferno
 
-[![CI](https://github.com/pratyushmathur1/inferno/actions/workflows/ci.yml/badge.svg)](https://github.com/pratyushmathur1/inferno/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **From-scratch Llama serving in C++/CUDA:** continuous batching, paged KV, and GPU kernels — with greedy answers unchanged under concurrency.
