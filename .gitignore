@@ -4,6 +4,7 @@ gpu-job.out
 inferno-dev.out
 hf-download.log
 compare-*.out
+*.out
 *.bin
 *.inf1
 *.o
@@ -12,4 +13,5 @@ scripts/__pycache__/
 __pycache__/
 models/real
 models/smollm2-*
+.DS_Store
 

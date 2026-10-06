@@ -1,0 +1,6 @@
+# torch + transformers are enough for weight conversion, text demo, and benches.
+# Install CUDA builds of torch separately when running GPU comparisons.
+torch>=2.1.0
+transformers>=4.40.0
+safetensors>=0.4.0
+numpy>=1.24.0

@@ -4,6 +4,8 @@
 
 Build a small, from-scratch LLM **serving** stack and prove continuous batching + paged KV + GPU kernels can get faster **without changing greedy answers**. Every optimization sits behind a flag, keeps token identity with the serial path, and ships with a measured table.
 
+**Fairness note:** Inferno numbers below are FP32 unless stated. PyTorch / vLLM baselines are often FP16 — treat memory and absolute tok/s as directional until Inferno has an FP16 path. Greedy token checks are always vs HuggingFace FP32.
+
 ## What these numbers show
 
 - **Real weights:** SmolLM2-135M Instruct in INF1 matches HuggingFace FP32 greedy tokens; text demo via HF tokenizer.
