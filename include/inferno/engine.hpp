@@ -2,6 +2,7 @@
 
 #include "inferno/cuda_api.hpp"
 #include "inferno/model.hpp"
+#include "inferno/prefix_cache.hpp"
 #include "inferno/scheduler.hpp"
 #include "inferno/types.hpp"
 
@@ -24,10 +25,9 @@ public:
     Metrics metrics() const;
     const Model& model() const { return model_; }
     PagedCache& cache() { return cache_; }
+    PrefixCache& prefixes() { return prefixes_; }
     const EngineConfig& config() const { return cfg_; }
 
-    // Continuous batching across concurrent clients. start() launches the
-    // worker that mixes new submissions into the running batch each step.
     void start();
     void stop();
     std::future<GenerationResult> submit(Request req);
@@ -42,6 +42,7 @@ private:
     Model model_;
     EngineConfig cfg_;
     PagedCache cache_;
+    PrefixCache prefixes_;
     Metrics last_metrics_{};
     mutable std::mutex metrics_mu_;
     void* device_ = nullptr;

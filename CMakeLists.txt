@@ -17,6 +17,7 @@ find_package(OpenMP)
 add_library(inferno
     src/cpu_kernels.cpp
     src/paged_cache.cpp
+    src/prefix_cache.cpp
     src/model.cpp
     src/scheduler.cpp
     src/engine.cpp

@@ -33,6 +33,7 @@ for arg in "$@"; do
 done
 
 echo "==> CPU build + tests"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="${CXX:-g++}"
 cmake --build build -j
 ./build/inferno_tests
@@ -91,5 +92,12 @@ python3 scripts/serious_bench.py "$MODEL" \
   --chat --max-new 32 \
   --out results/serious_bench_reproduce.json
 
-echo "Wrote results/text_demo_reproduce.txt and results/serious_bench_reproduce.json"
+echo "==> prefix-cache TTFT (shared system prompt)"
+SYS=$(python3 -c 'print(",".join(str((i*7+3)%49152) for i in range(512)))')
+USR=$(python3 -c 'print(",".join(str((i*11+5)%49152) for i in range(16)))')
+./build-gpu/inferno bench-prefix -m "$MODEL" \
+  --system-tokens "$SYS" --user-tokens "$USR" --seqs 8 --max-new 16 --cuda --no-graphs \
+  | tee results/prefix_smollm_reproduce.txt
+
+echo "Wrote results/text_demo_reproduce.txt, results/serious_bench_reproduce.json, results/prefix_smollm_reproduce.txt"
 echo "Compare against tables in RESULTS.md"

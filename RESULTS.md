@@ -12,6 +12,7 @@ Build a small, from-scratch LLM **serving** stack and prove continuous batching 
 - **cuBLAS** is the production GEMM; tiled stays as `--naive-gemm`. **6.7× / 8.9×** tok/s on mid / large toys.
 - **Fused add+RMSNorm** cuts profiled `misc` (~10% → ~5% on mid); batch tok/s up slightly on large (12638 vs 12204).
 - **Speculative decoding** matches target-only greedy; self-draft ~100% accept; shallow drafts need training for speedups.
+- **Prefix caching** reuses KV for identical system prompts: on SmolLM2-135M / A100, warm TTFT drops **11.8×–24.9×** vs uncached (8–16 concurrent seqs, 256–512 shared tokens).
 - On mid toys, GEMM drops from ~78% → ~29% of profiled decode time after cuBLAS.
 
 ---
@@ -59,6 +60,21 @@ Files: `results/profile_smollm_*.txt`, `results/latency_smollm_*.txt`.
 | first 15 layers | 4 | ~4 | <1× | cheap baseline; needs a trained drafter for wins |
 
 Outputs match target-only greedy (enforced in `speculate`). See `results/speculate_*.txt`.
+
+### Prefix caching (shared system prompt) — 6 Oct 2026, A100 g012
+
+N concurrent requests share a block-aligned system prefix; unique 16-token user suffixes.
+Warm path retains KV pages across `generate()`. TTFT = concurrent batch with `max_new=1`.
+
+| seqs | system | TTFT off ms | TTFT on ms | TTFT speedup | wall speedup | tokens saved |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 256 | 247.9 | **21.0** | **11.8×** | 2.3× | 2048 |
+| 8 | 512 | 595.3 | **27.8** | **21.4×** | 3.5× | 4096 |
+| 16 | 512 | 1171.3 | **47.0** | **24.9×** | 5.4× | 8192 |
+
+Warm path: 0 misses, N hits. Greedy tokens match uncached serial (unit test). Files: `results/prefix_smollm_*.txt`.
+
+CLI: `inferno bench-prefix -m … --system-tokens … --user-tokens … --seqs N`.
 
 ### Fused kernels (CUDA-event profile, mid 2×256)
 

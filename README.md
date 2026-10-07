@@ -9,7 +9,7 @@ Built to learn and measure the pieces inside vLLM-class systems, not to replace 
 
 ![Inferno demo](docs/demo.svg)
 
-## Headline result (SmolLM2-135M, A100)
+## Headline results (SmolLM2-135M, A100)
 
 Chat prompt, ~27 new tokens. Full tables: [`RESULTS.md`](RESULTS.md).
 
@@ -18,6 +18,13 @@ Chat prompt, ~27 new tokens. Full tables: [`RESULTS.md`](RESULTS.md).
 | **Inferno FP32 + cuBLAS** | **279** | **8.5** | 3.4 | 1744 |
 | PyTorch FP16 | 35 | 30.0 | 28.5 | 336 |
 | vLLM 0.4.2 FP16 | 378 | 14.6 | **2.5** | 19543 |
+
+**Prefix caching** (shared system prompt, warm KV reuse, 16 concurrent × 512 system tokens):
+
+| path | TTFT ms | speedup |
+|---|---:|---:|
+| uncached | 1171 | — |
+| **`--prefix-cache`** | **47** | **24.9×** |
 
 > **Fairness:** Inferno is FP32 today; PyTorch/vLLM baselines above are FP16. Token identity is matched against HuggingFace FP32 greedy. Latency favors Inferno vs naive `generate`; vLLM still wins throughput — the honest place for a from-scratch engine. Memory is not apples-to-apples until an FP16 path lands.
 
@@ -34,15 +41,18 @@ HTTP  POST /v1/completions
         │
      paged KV             block table per sequence
         │
+  prefix cache            shared system-prompt KV pages
+        │
    CPU / GPU kernels      cuBLAS GEMM, fused add+RMSNorm, paged attn
 ```
 
 - End-to-end serve loop with `POST /v1/completions`
 - Paged KV + continuous batching; preemption keeps greedy tokens stable
+- **Prefix caching:** reuse KV for identical system / chat-template prefixes (`--prefix-cache`); `bench-prefix` measures TTFT before/after on N concurrent requests
 - Real INF1 weights from HF; tokenizer-backed text demo
 - Speculative decoding (Leviathan verify) with acceptance metrics
 - Ablations behind flags: `--naive-gemm`, `--no-fuse`, `--no-graphs`
-- Correctness suite: kernels, paged attn, batching, preemption, HTTP
+- Correctness suite: kernels, paged attn, batching, preemption, prefix cache, HTTP
 
 Deeper design: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
@@ -95,7 +105,7 @@ GPU flags: `--cuda` / `--cpu` / `--no-graphs` / `--naive-gemm` / `--no-fuse` / `
 
 | Doc / path | Contents |
 |---|---|
-| [`RESULTS.md`](RESULTS.md) | A100 ablations: cuBLAS, fusion, speculation, batch scaling |
+| [`RESULTS.md`](RESULTS.md) | A100 ablations: cuBLAS, fusion, prefix cache, speculation, batch scaling |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Scheduler, paged KV, GPU dataflow |
 | `results/` | Raw JSON + CUDA-event profiles |
 | `scripts/serious_bench.py` | TTFT / ITL / tok/s / memory vs PyTorch |

@@ -33,6 +33,8 @@ struct EngineConfig {
     bool use_cublas = true;   // GPU only; false keeps the tiled teaching GEMM
     bool profile_cuda = false;
     bool fuse_kernels = true; // GPU fused add+rmsnorm
+    bool prefix_caching = false;
+    bool retain_prefix_cache = true;  // keep shared pages warm across generate() calls
 };
 
 struct Request {
@@ -42,6 +44,9 @@ struct Request {
     float temperature = 0.f;
     int top_k = 40;
     std::uint64_t seed = 1;
+    // Leading tokens that may be shared (system / chat template). 0 → full prompt
+    // length (still rounded down to a multiple of block_size).
+    int prefix_len = 0;
 };
 
 struct GenerationResult {
@@ -64,6 +69,9 @@ struct Metrics {
     std::int64_t preemptions = 0;
     std::int64_t requests = 0;
     std::int64_t steps = 0;
+    std::int64_t prefix_hits = 0;
+    std::int64_t prefix_misses = 0;
+    std::int64_t prefix_tokens_saved = 0;
 };
 
 }  // namespace inferno

@@ -56,6 +56,22 @@ KV is stored in fixed-size blocks (`block_size` tokens). Each sequence has a
 - GPU attention reads K/V through the same tables (page-at-a-time kernel).
 - Non-contiguous tables are correctness-tested against a dense online attention walk.
 
+## Prefix caching (shared system prompts)
+
+Identical leading tokens (chat template / system prompt) share the same physical
+KV pages. Sharing is **block-aligned**: length `L` is rounded down to a multiple
+of `block_size`.
+
+- `PrefixCache` hashes the shared span (FNV-1a). A miss allocates pages and marks
+  one sequence as **owner**; concurrent followers wait until the owner’s
+  `computed ≥ L`, then attach the same block ids with `computed = L`.
+- Hits skip the shared prefill entirely (warm path across `generate()` when
+  `retain_prefix_cache` is on). Private suffix pages stay per-sequence.
+- Preemption frees only private suffix pages; shared pages stay until the last
+  reference drops (or are retained warm).
+- Flag: `--prefix-cache`. Bench: `bench-prefix` reports TTFT before/after for
+  N concurrent requests with the same system prompt.
+
 ## Model forward
 
 Grouped-query Llama block (float32 INF1 weights):

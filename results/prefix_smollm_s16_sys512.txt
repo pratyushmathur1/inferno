@@ -1,0 +1,18 @@
+PREFIX {
+  "seqs":16,
+  "system_tokens":512,
+  "user_tokens":16,
+  "max_new":16,
+  "ttft_off_ms":1171.27,
+  "ttft_on_ms":46.972,
+  "ttft_speedup":24.9354,
+  "wall_off_ms":1426.07,
+  "wall_on_ms":262.984,
+  "wall_speedup":5.42262,
+  "off_tok_s":179.515,
+  "on_tok_s":973.442,
+  "prefix_hits":16,
+  "prefix_misses":0,
+  "prefix_tokens_saved":8192,
+  "device":"gpu"
+}

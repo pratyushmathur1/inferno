@@ -10,7 +10,8 @@ Engine::Engine(Model model, EngineConfig cfg)
     : model_(std::move(model)),
       cfg_(cfg),
       cache_(model_.config().n_layers, model_.config().n_kv_heads, model_.config().head_dim,
-             cfg.num_blocks, cfg.block_size) {
+             cfg.num_blocks, cfg.block_size),
+      prefixes_(cfg.block_size) {
     if (cfg_.use_cuda && !cuda::available()) {
         throw std::runtime_error(
             "CUDA was requested, but this binary has no GPU runtime. Rebuild with -DINFERNO_CUDA=ON on a machine with nvcc.");
@@ -25,7 +26,8 @@ Engine::~Engine() {
 
 std::vector<GenerationResult> Engine::generate(const std::vector<Request>& requests) {
     if (running_) throw std::runtime_error("stop the continuous-batching worker before generate()");
-    Scheduler sched(cache_, cfg_.max_batched_tokens, cfg_.max_seqs, model_.config().eos_id);
+    Scheduler sched(cache_, cfg_.prefix_caching ? &prefixes_ : nullptr, cfg_.max_batched_tokens,
+                    cfg_.max_seqs, model_.config().eos_id, cfg_.prefix_caching, cfg_.retain_prefix_cache);
     for (const auto& req : requests) sched.add(req);
     std::vector<GenerationResult> out;
     while (sched.has_work()) {
@@ -67,8 +69,8 @@ void Engine::start() {
         std::lock_guard<std::mutex> lock(mu_);
         if (running_) return;
         stop_ = false;
-        running_ = true;
     }
+    running_ = true;
     worker_ = std::thread([this] { worker(); });
 }
 
@@ -96,7 +98,8 @@ std::future<GenerationResult> Engine::submit(Request req) {
 }
 
 void Engine::worker() {
-    Scheduler sched(cache_, cfg_.max_batched_tokens, cfg_.max_seqs, model_.config().eos_id);
+    Scheduler sched(cache_, cfg_.prefix_caching ? &prefixes_ : nullptr, cfg_.max_batched_tokens,
+                    cfg_.max_seqs, model_.config().eos_id, cfg_.prefix_caching, cfg_.retain_prefix_cache);
     std::unordered_map<int, std::promise<GenerationResult>> inflight;
     int next_id = 1;
     auto fulfill = [&](std::vector<GenerationResult> done) {

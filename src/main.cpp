@@ -12,6 +12,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -25,10 +26,11 @@ void usage() {
         << "  inferno generate -m model.bin --tokens 1,2,3 --max-new 16 [--temp 0] [--cpu]\n"
         << "  inferno speculate -m target.inf1 --draft draft.inf1 --tokens … --max-new 64 --gamma 4\n"
         << "  inferno bench-latency -m model.inf1 --tokens … --max-new 32\n"
+        << "  inferno bench-prefix -m model.inf1 --system-tokens … --user-tokens … --seqs N\n"
         << "  inferno compare-workload -m model.bin [--seqs 8] [--prompt 12] [--max-new 12] [--cpu]\n"
         << "  inferno profile-forward -m model.bin [--seqs 8] [--prompt 12] [--max-new 4] [--naive-gemm] [--no-fuse]\n"
         << "  inferno serve -m model.bin [--port 8000] [--cpu]\n"
-        << "\nGPU flags: --cuda | --cpu | --no-graphs | --naive-gemm | --no-fuse | --profile-forward\n"
+        << "\nGPU flags: --cuda | --cpu | --no-graphs | --naive-gemm | --no-fuse | --prefix-cache | --profile-forward\n"
         << "Text demo: python3 scripts/generate_text.py -m model.inf1 --hf <hub_id> --prompt \"…\"\n";
 }
 
@@ -99,6 +101,8 @@ int main(int argc, char** argv) {
         std::string model_path;
         std::string draft_path;
         std::string token_str;
+        std::string system_token_str;
+        std::string user_token_str;
         std::string out_path = "model.bin";
         int port = 8000;
         int max_new = 16;
@@ -117,12 +121,15 @@ int main(int argc, char** argv) {
         bool use_cublas = true;
         bool fuse_kernels = true;
         bool profile_cuda = false;
+        bool prefix_caching = false;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             if (a == "-m" || a == "--model") model_path = need(i, argc, argv, a);
             else if (a == "--draft") draft_path = need(i, argc, argv, a);
             else if (a == "-o" || a == "--out") out_path = need(i, argc, argv, a);
             else if (a == "--tokens") token_str = need(i, argc, argv, a);
+            else if (a == "--system-tokens") system_token_str = need(i, argc, argv, a);
+            else if (a == "--user-tokens") user_token_str = need(i, argc, argv, a);
             else if (a == "--max-new") max_new = std::stoi(need(i, argc, argv, a));
             else if (a == "--temp") temp = std::stof(need(i, argc, argv, a));
             else if (a == "--port") port = std::stoi(need(i, argc, argv, a));
@@ -140,6 +147,7 @@ int main(int argc, char** argv) {
             else if (a == "--no-graphs") graphs = false;
             else if (a == "--naive-gemm") use_cublas = false;
             else if (a == "--no-fuse") fuse_kernels = false;
+            else if (a == "--prefix-cache") prefix_caching = true;
             else if (a == "--profile-forward") profile_cuda = true;
             else throw std::runtime_error("unknown flag " + a);
         }
@@ -173,6 +181,7 @@ int main(int argc, char** argv) {
         ecfg.use_cublas = use_cublas;
         ecfg.fuse_kernels = fuse_kernels;
         ecfg.profile_cuda = profile_cuda || cmd == "profile-forward";
+        ecfg.prefix_caching = prefix_caching || cmd == "bench-prefix";
         if (num_blocks > 0) ecfg.num_blocks = num_blocks;
         // Real models need room for prompt+new; bump if still at default and model is large.
         if (num_blocks <= 0 && model.config().n_layers >= 8) {
@@ -364,6 +373,95 @@ int main(int argc, char** argv) {
                       << (wall_ms > 0 ? 1000.0 * gen / wall_ms : 0.0) << ",\"gpu_mem_mb\":" << mem_mb
                       << ",\"fuse\":" << (ecfg.fuse_kernels ? "true" : "false") << ",\"device\":\""
                       << (ecfg.use_cuda ? "gpu" : "cpu") << "\"}\n";
+            return 0;
+        }
+        if (cmd == "bench-prefix") {
+            if (system_token_str.empty() || user_token_str.empty()) {
+                throw std::runtime_error("bench-prefix needs --system-tokens and --user-tokens");
+            }
+            if (seqs < 1) throw std::runtime_error("seqs must be >= 1");
+            auto system = parse_tokens(system_token_str);
+            auto user = parse_tokens(user_token_str);
+            // Align system length down to block size so the shared span is exact.
+            const int bs = ecfg.block_size;
+            const int shared = (static_cast<int>(system.size()) / bs) * bs;
+            if (shared < bs) throw std::runtime_error("system prompt must cover at least one KV block");
+            system.resize(static_cast<std::size_t>(shared));
+
+            auto make_batch = [&](bool) {
+                std::vector<inferno::Request> reqs;
+                for (int i = 0; i < seqs; ++i) {
+                    inferno::Request r;
+                    r.id = i;
+                    r.prompt = system;
+                    // Unique user suffix per sequence (mutate last user token).
+                    auto u = user;
+                    if (!u.empty()) u.back() = (u.back() + i) % std::max(1, model.vocab());
+                    r.prompt.insert(r.prompt.end(), u.begin(), u.end());
+                    r.prefix_len = shared;
+                    r.max_new_tokens = std::max(1, max_new);
+                    r.temperature = 0.f;
+                    r.seed = static_cast<std::uint64_t>(i + 1);
+                    reqs.push_back(std::move(r));
+                }
+                return reqs;
+            };
+
+            // Measure TTFT (max_new=1) and full wall for the same concurrent batch.
+            // Warm path: first generate fills / retains the shared system prefix pages;
+            // the timed generate should hit for all N seqs when cache_on.
+            auto run = [&](bool cache_on) {
+                inferno::EngineConfig cfg = ecfg;
+                cfg.prefix_caching = cache_on;
+                cfg.retain_prefix_cache = true;
+                cfg.profile_cuda = false;
+                cfg.cuda_graphs = false;  // shape varies; keep timing honest
+                if (cfg.num_blocks < 512) cfg.num_blocks = 512;
+                if (cfg.max_seqs < seqs) cfg.max_seqs = seqs;
+                inferno::Engine eng(model, cfg);
+                auto batch = make_batch(cache_on);
+                eng.generate(batch);  // warmup (+ fill prefix when cache_on)
+
+                auto ttft_batch = make_batch(cache_on);
+                for (auto& r : ttft_batch) r.max_new_tokens = 1;
+                auto t0 = std::chrono::steady_clock::now();
+                eng.generate(ttft_batch);
+                double ttft_ms =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+                batch = make_batch(cache_on);
+                t0 = std::chrono::steady_clock::now();
+                auto out = eng.generate(batch);
+                double wall_ms =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                int gen = 0;
+                for (const auto& r : out) gen += r.generated;
+                auto m = eng.metrics();
+                return std::tuple<double, double, int, inferno::Metrics>(ttft_ms, wall_ms, gen, m);
+            };
+
+            auto [ttft_off, wall_off, gen_off, m_off] = run(false);
+            auto [ttft_on, wall_on, gen_on, m_on] = run(true);
+            const double ttft_speedup = ttft_on > 0.0 ? ttft_off / ttft_on : 0.0;
+            const double wall_speedup = wall_on > 0.0 ? wall_off / wall_on : 0.0;
+            std::cout << "PREFIX {\n"
+                      << "  \"seqs\":" << seqs << ",\n"
+                      << "  \"system_tokens\":" << shared << ",\n"
+                      << "  \"user_tokens\":" << user.size() << ",\n"
+                      << "  \"max_new\":" << std::max(1, max_new) << ",\n"
+                      << "  \"ttft_off_ms\":" << ttft_off << ",\n"
+                      << "  \"ttft_on_ms\":" << ttft_on << ",\n"
+                      << "  \"ttft_speedup\":" << ttft_speedup << ",\n"
+                      << "  \"wall_off_ms\":" << wall_off << ",\n"
+                      << "  \"wall_on_ms\":" << wall_on << ",\n"
+                      << "  \"wall_speedup\":" << wall_speedup << ",\n"
+                      << "  \"off_tok_s\":" << (wall_off > 0 ? 1000.0 * gen_off / wall_off : 0.0) << ",\n"
+                      << "  \"on_tok_s\":" << (wall_on > 0 ? 1000.0 * gen_on / wall_on : 0.0) << ",\n"
+                      << "  \"prefix_hits\":" << m_on.prefix_hits << ",\n"
+                      << "  \"prefix_misses\":" << m_on.prefix_misses << ",\n"
+                      << "  \"prefix_tokens_saved\":" << m_on.prefix_tokens_saved << ",\n"
+                      << "  \"device\":\"" << (ecfg.use_cuda ? "gpu" : "cpu") << "\"\n"
+                      << "}\n";
             return 0;
         }
         if (cmd == "serve") {

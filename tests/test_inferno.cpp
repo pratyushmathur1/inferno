@@ -257,6 +257,45 @@ void test_scheduler() {
     inferno::Request hot{1, prompt_of(3, model.vocab(), 2), 4, 0.8f, 8, 99};
     auto sample = gen(model, roomy(), {hot});
     check(sample[0].ok && sample[0].generated == 4, "temperature sampling returns max_new tokens");
+
+    // Prefix caching: N concurrent prompts sharing a block-aligned system prefix
+    // must match uncached greedy tokens and report hits / tokens saved.
+    {
+        inferno::EngineConfig pc = roomy(256);
+        pc.block_size = 4;
+        pc.num_blocks = 64;
+        pc.prefix_caching = true;
+        pc.retain_prefix_cache = false;
+        std::vector<int> system = prompt_of(8, model.vocab(), 42);  // 2 full blocks
+        std::vector<inferno::Request> batch;
+        std::vector<inferno::Request> serial;
+        for (int i = 0; i < 4; ++i) {
+            std::vector<int> prompt = system;
+            auto user = prompt_of(3, model.vocab(), 100 + i);
+            prompt.insert(prompt.end(), user.begin(), user.end());
+            inferno::Request r;
+            r.id = i;
+            r.prompt = prompt;
+            r.prefix_len = static_cast<int>(system.size());
+            r.max_new_tokens = 4;
+            r.temperature = 0.f;
+            r.top_k = 1;
+            r.seed = 1;
+            batch.push_back(r);
+            serial.push_back(r);
+        }
+        inferno::Engine cached(model, pc);
+        auto with = cached.generate(batch);
+        check(cached.metrics().prefix_misses == 1, "one prefix miss for the shared system prompt");
+        check(cached.metrics().prefix_hits >= 3, "remaining sequences hit the shared prefix");
+        check(cached.metrics().prefix_tokens_saved >= 8 * 3, "followers skip the shared prefix tokens");
+        inferno::EngineConfig off = pc;
+        off.prefix_caching = false;
+        for (int i = 0; i < 4; ++i) {
+            auto alone = gen(model, off, {serial[static_cast<std::size_t>(i)]});
+            check(alone[0].tokens == by_id(with, i)->tokens, "prefix-cached batch matches uncached serial");
+        }
+    }
 }
 
 void test_speculative() {

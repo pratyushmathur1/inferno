@@ -157,7 +157,10 @@ std::string metrics_text(const Metrics& m) {
     o << "inferno_tokens_processed " << m.tokens_processed << "\n"
       << "inferno_preemptions " << m.preemptions << "\n"
       << "inferno_requests " << m.requests << "\n"
-      << "inferno_steps " << m.steps << "\n";
+      << "inferno_steps " << m.steps << "\n"
+      << "inferno_prefix_hits " << m.prefix_hits << "\n"
+      << "inferno_prefix_misses " << m.prefix_misses << "\n"
+      << "inferno_prefix_tokens_saved " << m.prefix_tokens_saved << "\n";
     return o.str();
 }
 

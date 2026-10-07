@@ -1,6 +1,7 @@
 #pragma once
 
 #include "inferno/paged_cache.hpp"
+#include "inferno/prefix_cache.hpp"
 #include "inferno/types.hpp"
 
 #include <random>
@@ -16,12 +17,12 @@ struct Step {
 };
 
 // Continuous batching with chunked prefill and priority preemption.
-// Earlier arrivals outrank later ones. A higher-priority running sequence
-// may reclaim pages from a lower-priority one; the victim is recomputed
-// from its already sampled tokens, so greedy outputs stay stable.
+// Optional automatic prefix caching: identical block-aligned prompt prefixes
+// share physical KV pages (system prompts / chat templates).
 class Scheduler {
 public:
-    Scheduler(PagedCache& cache, int max_batched_tokens, int max_seqs, int eos_id);
+    Scheduler(PagedCache& cache, PrefixCache* prefixes, int max_batched_tokens, int max_seqs, int eos_id,
+              bool prefix_caching, bool retain_prefixes);
 
     void add(Request req);
     bool has_work() const;
@@ -49,6 +50,12 @@ private:
         std::uint64_t seed = 1;
         std::mt19937 rng{1};
         std::vector<int> blocks;
+        int shared_len = 0;           // block-aligned shared prefix length
+        int shared_blocks = 0;        // number of leading blocks that are shared
+        std::uint64_t prefix_hash = 0;
+        bool has_prefix = false;
+        bool prefix_owner = false;
+        bool waiting_prefix = false;  // follower waiting for owner to fill shared pages
         bool running = false;
         bool waiting = false;
         bool finished = false;
@@ -59,12 +66,16 @@ private:
     bool ensure_blocks(Seq& s, int pos);
     bool preempt_lower_than(const Seq& s);
     void finish(Seq& s);
+    void attach_prefix(Seq& s, int prefix_len);
     int running_count() const;
 
     PagedCache& cache_;
+    PrefixCache* prefixes_ = nullptr;
     int max_batched_tokens_;
     int max_seqs_;
     int eos_id_;
+    bool prefix_caching_ = false;
+    bool retain_prefixes_ = true;
     int arrival_clock_ = 0;
     int preemptions_ = 0;
     std::vector<Seq> seqs_;
