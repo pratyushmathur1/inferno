@@ -8,26 +8,26 @@ across chunked prefill, mixed batches, and preemption.
 
 ```
 Client
-  │  POST /v1/completions  (token_ids, max_tokens, temperature)
-  ▼
-HttpServer                 thin JSON ↔ Request bridge
-  │  Engine::submit
-  ▼
+  |  POST /v1/completions  (token_ids, max_tokens, temperature)
+  v
+HttpServer                 thin JSON <-> Request bridge
+  |  Engine::submit
+  v
 Engine worker              continuous batching loop
-  │  Scheduler::prepare / commit
-  ▼
+  |  Scheduler::prepare / commit
+  v
 Scheduler                  chunked prefill, FCFS priority, preemption
-  │  allocates / frees pages
-  ▼
+  |  allocates / frees pages; PrefixCache for shared prefixes
+  v
 PagedCache                 block table per sequence (host)
-  │  tables + token ids copied each step
-  ▼
+  |  tables + token ids copied each step
+  v
 CPU kernels  or  CUDA kernels
-  RMSNorm · RoPE · SwiGLU · GEMM · paged attention
+  RMSNorm / RoPE / SwiGLU / GEMM / paged attention
   (GPU: cuBLAS GEMM, fused add+RMSNorm, optional CUDA graphs)
-  │
-  ▼
-logits → sample / greedy → Scheduler::commit → GenerationResult
+  |
+  v
+logits -> sample / greedy -> Scheduler::commit -> GenerationResult
 ```
 
 ## Scheduler
@@ -99,6 +99,7 @@ target-only greedy generation (enforced in tests and the CLI metrics).
 | `src/server.cpp` | HTTP `/health`, `/v1/completions` |
 | `src/engine.cpp` | Queue + worker thread + device binding |
 | `src/scheduler.cpp` | Continuous batching + preemption |
+| `src/prefix_cache.cpp` | Shared prefix hash, refcounts, warm retain |
 | `src/paged_cache.cpp` | Block pool + tables |
 | `src/model.cpp` | INF1 load / CPU forward orchestration |
 | `kernels/cuda_kernels.cu` | Device forward, fusion, graphs, cuBLAS |

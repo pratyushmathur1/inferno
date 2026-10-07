@@ -51,7 +51,6 @@ Chat prompt “Explain continuous batching in two sentences.”, max_new=64. Inf
 
 Files: `results/profile_smollm_*.txt`, `results/latency_smollm_*.txt`.
 
-
 ### Speculative decoding
 
 | Draft | gamma | accept % | speedup vs target-only | notes |
@@ -119,6 +118,7 @@ Raw JSON: `results/gpu_sweep_latest.json`.
 
 ## Takeaways
 
-- Serving correctness first: batching, preemption, speculative verify, and CPU/GPU paths must not change greedy output.
+- Serving correctness first: batching, preemption, prefix reuse, speculative verify, and CPU/GPU paths must not change greedy output.
 - cuBLAS + fusion are the production GPU path; tiled / `--no-fuse` remain as teaching ablations.
+- Prefix caching is the largest measured TTFT win on shared system prompts (up to ~25x warm on SmolLM2/A100).
 - Real HF weights + tokenizer make Inferno an end-to-end engine; speculative decoding is wired with public acceptance metrics.

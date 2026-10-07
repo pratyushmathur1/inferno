@@ -3,7 +3,7 @@
 [![CI](https://github.com/pratyushmathur1/inferno/actions/workflows/ci.yml/badge.svg)](https://github.com/pratyushmathur1/inferno/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**From-scratch Llama serving in C++/CUDA:** continuous batching, paged KV, and GPU kernels — with greedy answers unchanged under concurrency.
+**From-scratch Llama serving in C++/CUDA:** continuous batching, paged KV, prefix caching, and GPU kernels -- with greedy answers unchanged under concurrency.
 
 Built to learn and measure the pieces inside vLLM-class systems, not to replace them. Runs real HuggingFace Llama-arch weights (SmolLM2-135M) end-to-end.
 
@@ -11,7 +11,9 @@ Built to learn and measure the pieces inside vLLM-class systems, not to replace 
 
 ## Headline results (SmolLM2-135M, A100)
 
-Chat prompt, ~27 new tokens. Full tables: [`RESULTS.md`](RESULTS.md).
+Full tables: [`RESULTS.md`](RESULTS.md).
+
+**Latency** (chat prompt, ~27 new tokens):
 
 | Engine | tok/s | TTFT ms | ITL ms | GPU mem MB |
 |---|---:|---:|---:|---:|
@@ -19,30 +21,30 @@ Chat prompt, ~27 new tokens. Full tables: [`RESULTS.md`](RESULTS.md).
 | PyTorch FP16 | 35 | 30.0 | 28.5 | 336 |
 | vLLM 0.4.2 FP16 | 378 | 14.6 | **2.5** | 19543 |
 
-**Prefix caching** (shared system prompt, warm KV reuse, 16 concurrent × 512 system tokens):
+**Prefix caching** (shared system prompt, warm KV reuse, 16 concurrent x 512 system tokens):
 
 | path | TTFT ms | speedup |
 |---|---:|---:|
-| uncached | 1171 | — |
-| **`--prefix-cache`** | **47** | **24.9×** |
+| uncached | 1171 | 1.0x |
+| **`--prefix-cache`** | **47** | **24.9x** |
 
-> **Fairness:** Inferno is FP32 today; PyTorch/vLLM baselines above are FP16. Token identity is matched against HuggingFace FP32 greedy. Latency favors Inferno vs naive `generate`; vLLM still wins throughput — the honest place for a from-scratch engine. Memory is not apples-to-apples until an FP16 path lands.
+> **Fairness:** Inferno is FP32 today; PyTorch/vLLM baselines above are FP16. Token identity is matched against HuggingFace FP32 greedy. Latency favors Inferno vs naive `generate`; vLLM still wins throughput -- the honest place for a from-scratch engine. Memory is not apples-to-apples until an FP16 path lands.
 
 ## What it does
 
 ```
 HTTP  POST /v1/completions
-        │
+        |
    request queue          Engine::submit
-        │
+        |
  continuous batching      chunked prefill, FCFS preemption
-        │
+        |
    prefill / decode       one packed forward per scheduler step
-        │
+        |
      paged KV             block table per sequence
-        │
-  prefix cache            shared system-prompt KV pages
-        │
+        |
+   prefix cache           shared system-prompt KV pages
+        |
    CPU / GPU kernels      cuBLAS GEMM, fused add+RMSNorm, paged attn
 ```
 
@@ -51,7 +53,7 @@ HTTP  POST /v1/completions
 - **Prefix caching:** reuse KV for identical system / chat-template prefixes (`--prefix-cache`); `bench-prefix` measures TTFT before/after on N concurrent requests
 - Real INF1 weights from HF; tokenizer-backed text demo
 - Speculative decoding (Leviathan verify) with acceptance metrics
-- Ablations behind flags: `--naive-gemm`, `--no-fuse`, `--no-graphs`
+- Ablations behind flags: `--naive-gemm`, `--no-fuse`, `--no-graphs`, `--prefix-cache`
 - Correctness suite: kernels, paged attn, batching, preemption, prefix cache, HTTP
 
 Deeper design: [`ARCHITECTURE.md`](ARCHITECTURE.md).
@@ -85,34 +87,41 @@ python3 scripts/generate_text.py \
 ### Serve
 
 ```bash
-./build-gpu/inferno serve -m models/smollm2-135m.inf1 --port 8000
+./build-gpu/inferno serve -m models/smollm2-135m.inf1 --port 8000 --prefix-cache
 curl -s http://127.0.0.1:8000/v1/completions \
   -H 'content-type: application/json' \
   -d '{"token_ids":[1,5,9,12],"max_tokens":16,"temperature":0}'
+```
+
+### Prefix-cache bench
+
+```bash
+./build-gpu/inferno bench-prefix -m models/smollm2-135m.inf1 \
+  --system-tokens 1,2,3,... --user-tokens 10,11,12 --seqs 16 --cuda
 ```
 
 ### Reproduce benches
 
 ```bash
 ./scripts/reproduce.sh              # CPU tests + GPU build
-./scripts/reproduce.sh --full       # + SmolLM2 convert, text demo, latency bench
+./scripts/reproduce.sh --full       # + SmolLM2 convert, text demo, latency + prefix benches
 ./scripts/reproduce.sh --cpu-only   # CI-equivalent local run
 ```
 
-GPU flags: `--cuda` / `--cpu` / `--no-graphs` / `--naive-gemm` / `--no-fuse` / `--profile-forward`.
+GPU flags: `--cuda` / `--cpu` / `--no-graphs` / `--naive-gemm` / `--no-fuse` / `--prefix-cache` / `--profile-forward`.
 
 ## More
 
 | Doc / path | Contents |
 |---|---|
 | [`RESULTS.md`](RESULTS.md) | A100 ablations: cuBLAS, fusion, prefix cache, speculation, batch scaling |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Scheduler, paged KV, GPU dataflow |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Scheduler, paged KV, prefix cache, GPU dataflow |
 | `results/` | Raw JSON + CUDA-event profiles |
 | `scripts/serious_bench.py` | TTFT / ITL / tok/s / memory vs PyTorch |
 
 ```
 include/inferno/             public headers
-src/                         scheduler, model, HTTP, CPU kernels, speculative
+src/                         scheduler, prefix cache, model, HTTP, speculative
 kernels/cuda_kernels.cu      CUDA operators, fusion, graphs, cuBLAS
 scripts/                     HF convert, demos, benches, reproduce.sh
 tests/test_inferno.cpp       correctness suite
@@ -122,5 +131,6 @@ tests/test_inferno.cpp       correctness suite
 
 - Single GPU (or CPU). No multi-node serving.
 - Default weights path is float32 INF1; FP16 serving is future work.
+- Prefix sharing is block-aligned exact-match on the leading token span (not fuzzy / partial radix reuse beyond that).
 - Speculative decoding is correctness-complete; shallow drafts do not yet beat target-only latency (needs a trained drafter).
 - INT8 / FP8 / tensor-parallel helpers are CPU unit-tested, not the production serve path.
