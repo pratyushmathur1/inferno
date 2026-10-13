@@ -57,8 +57,10 @@ Files: `results/profile_smollm_*.txt`, `results/latency_smollm_*.txt`.
 |---|---:|---:|---:|---|
 | self (same INF1) | 4 | ~94–100 | <1× | validates algorithm; draft cost = target cost |
 | first 15 layers | 4 | ~4 | <1× | cheap baseline; needs a trained drafter for wins |
+| trained shallow (`train_draft.py`) | 4 | *(run bench)* | *(run bench)* | see `docs/DRAFT_TRAINING.md`; fill from `results/speculate_trained_draft.json` |
 
 Outputs match target-only greedy (enforced in `speculate`). See `results/speculate_*.txt`.
+
 
 ### Prefix caching (shared system prompt) — 6 Oct 2026, A100 g012
 

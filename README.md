@@ -100,6 +100,19 @@ curl -s http://127.0.0.1:8000/v1/completions \
   --system-tokens 1,2,3,... --user-tokens 10,11,12 --seqs 16 --cuda
 ```
 
+### Speculative draft (train → INF1 → bench)
+
+```bash
+# see docs/DRAFT_TRAINING.md for Anvil sbatch helpers
+python3 scripts/train_draft.py --layers 6 --steps 2000 --out runs/draft-smollm2-l6
+python3 scripts/bench_speculate.py \
+  --target models/smollm2-135m.inf1 \
+  --draft-hf runs/draft-smollm2-l6 \
+  --draft-out models/draft-smollm2-l6.inf1 \
+  --inferno ./build-gpu/inferno --chat \
+  --out results/speculate_trained_draft.json
+```
+
 ### Reproduce benches
 
 ```bash
@@ -116,6 +129,7 @@ GPU flags: `--cuda` / `--cpu` / `--no-graphs` / `--naive-gemm` / `--no-fuse` / `
 |---|---|
 | [`RESULTS.md`](RESULTS.md) | A100 ablations: cuBLAS, fusion, prefix cache, speculation, batch scaling |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Scheduler, paged KV, prefix cache, GPU dataflow |
+| [`docs/DRAFT_TRAINING.md`](docs/DRAFT_TRAINING.md) | Train / export / bench a speculative draft model |
 | `results/` | Raw JSON + CUDA-event profiles |
 | `scripts/serious_bench.py` | TTFT / ITL / tok/s / memory vs PyTorch |
 
@@ -132,5 +146,5 @@ tests/test_inferno.cpp       correctness suite
 - Single GPU (or CPU). No multi-node serving.
 - Default weights path is float32 INF1; FP16 serving is future work.
 - Prefix sharing is block-aligned exact-match on the leading token span (not fuzzy / partial radix reuse beyond that).
-- Speculative decoding is correctness-complete; shallow drafts do not yet beat target-only latency (needs a trained drafter).
+- Speculative decoding is correctness-complete; train a real drafter with `scripts/train_draft.py` (see [`docs/DRAFT_TRAINING.md`](docs/DRAFT_TRAINING.md)) — truncated-layer drafts alone do not beat target-only latency.
 - INT8 / FP8 / tensor-parallel helpers are CPU unit-tested, not the production serve path.

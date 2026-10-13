@@ -1,0 +1,6 @@
+# Prompts for speculative-decoding benches (one per line).
+Explain continuous batching in two sentences.
+What is a paged KV cache and why does it help LLM serving?
+Summarize speculative decoding for a systems engineer.
+Give three reasons greedy decoding is useful for correctness tests.
+Describe prefix caching for shared system prompts.

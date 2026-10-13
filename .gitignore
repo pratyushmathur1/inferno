@@ -13,5 +13,8 @@ scripts/__pycache__/
 __pycache__/
 models/real
 models/smollm2-*
+models/draft*
+runs/
+logs/
 .DS_Store
 
